@@ -35,7 +35,7 @@ message(STATUS "Toolchain: using C=${CMAKE_C_COMPILER} CXX=${CMAKE_CXX_COMPILER}
 
 set(PICOTOOL_FETCH_FROM_GIT_PATH "${LIBS_ROOT}/Third_Party/picotool/fetch_from_git.cmake")
 
-project(picow_blink C CXX ASM)
+project(picow_pwm_servos C CXX ASM)
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_CXX_STANDARD 26)
 
@@ -56,20 +56,7 @@ endif()
 # and toolchain flags take effect prior to any subdirectory or project() calls.
 pico_sdk_init()
 set(FREERTOS_THIRD_PARTY_DIR ${FREERTOS_KERNEL_PATH}/portable/ThirdParty)
-
-if (PICO_PLATFORM MATCHES "rp2040")
-        include(${FREERTOS_THIRD_PARTY_DIR}/GCC/RP2040/FreeRTOS_Kernel_import.cmake)
-elseif (PICO_PLATFORM MATCHES "rp2350")
-        # prefer the ARM NTZ community port if present
-        if (EXISTS "${FREERTOS_THIRD_PARTY_DIR}/Community-Supported-Ports/GCC/RP2350_ARM_NTZ/FreeRTOS_Kernel_import.cmake")
-                include(${FREERTOS_THIRD_PARTY_DIR}/Community-Supported-Ports/GCC/RP2350_ARM_NTZ/FreeRTOS_Kernel_import.cmake)
-        else()
-                message(FATAL_ERROR "FreeRTOS port for RP2350 not found under ${FREERTOS_THIRD_PARTY_DIR}. Ensure a port exists for your platform.")
-        endif()
-else()
-        # Default to RP2040 if not explicitly an RP2350 board
-        include(${FREERTOS_THIRD_PARTY_DIR}/RP2040/FreeRTOS_Kernel_import.cmake)
-endif()
+include(${FREERTOS_THIRD_PARTY_DIR}/Community-Supported-Ports/GCC/RP2350_ARM_NTZ/FreeRTOS_Kernel_import.cmake)
 
 
 # On Windows, CMake may choose the Visual Studio generator by default — detect
@@ -81,14 +68,19 @@ endif()
 
 
 
+add_executable(picow_pwm_servos
+        picow_pwm_servos.c
+        )
 
-add_executable(picow_blink
-        picow_blink.c
+target_link_libraries(picow_pwm_servos
+        pico_stdlib          # for core functionality
+        hardware_pwm         # for PWM helpers
         )
-target_link_libraries(picow_blink
-        pico_stdlib              # for core functionality
-        pico_cyw43_arch_none     # we need Wifi to access the GPIO, but we don't need anything else
-        )
+
+pico_enable_stdio_usb(picow_pwm_servos 1)
+pico_enable_stdio_uart(picow_pwm_servos 1)
+# create map/bin/hex file etc.
+pico_add_extra_outputs(picow_pwm_servos)
 
 
 add_compile_options(-Wall
@@ -99,6 +91,3 @@ add_compile_options(-Wall
 if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
     add_compile_options(-Wno-maybe-uninitialized)
 endif()
-
-# create map/bin/hex file etc.
-pico_add_extra_outputs(picow_blink)
