@@ -1,0 +1,87 @@
+# == DO NOT EDIT THE FOLLOWING LINES for the Raspberry Pi Pico VS Code Extension to work ==
+if(WIN32)
+    set(USERHOME $ENV{USERPROFILE})
+else()
+    set(USERHOME $ENV{HOME})
+endif()
+set(sdkVersion 2.2.0)
+set(toolchainVersion 14_2_Rel1)
+set(picotoolVersion 2.2.0-a4)
+set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
+if (EXISTS ${picoVscode})
+    include(${picoVscode})
+endif()
+# ====================================================================================
+#
+# lora915_tx_test — minimal standalone Pico 2 W program that transmits a short
+# numbered test packet once a second on the 915 MHz SX1276 (LoRa0, SPI0).
+#
+# Pair with lora915_rx_test on a second board to check the RF link end-to-end.
+#
+# Build (from this directory):
+#   mkdir build && cd build
+#   cmake .. && make
+# Output: build/lora915_tx_test.uf2  (drag onto the Pico in BOOTSEL mode)
+
+cmake_minimum_required(VERSION 3.13)
+
+set(PICO_PLATFORM rp2350-arm-s)
+set(PICO_BOARD pico2_w)
+
+# Locate the avionics root (4 levels up: projects/pico_examples/radio_examples/<name> -> Avionics)
+get_filename_component(AVIONICS_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../../.." ABSOLUTE)
+include(${AVIONICS_ROOT}/cmake/deps.cmake)
+
+# Pull in Pico SDK (must be before project())
+set(PICO_SDK_ROOT ${PICO_SDK_PATH})
+if (NOT EXISTS "${PICO_SDK_ROOT}/pico_sdk_init.cmake")
+    message(FATAL_ERROR "Pico SDK not found at ${PICO_SDK_ROOT}. "
+            "Initialize the submodule or set PICO_SDK_PATH.")
+endif()
+include(${PICO_SDK_ROOT}/pico_sdk_init.cmake)
+
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_OSX_ARCHITECTURES "" CACHE STRING "Disable host -arch when cross-compiling" FORCE)
+set(CMAKE_C_COMPILER arm-none-eabi-gcc)
+set(CMAKE_CXX_COMPILER arm-none-eabi-g++)
+set(CMAKE_TRY_COMPILE_TARGET_TYPE "STATIC_LIBRARY")
+
+project(lora915_tx_test C CXX ASM)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 23)
+
+pico_sdk_init()
+
+# -- RadioLib (local copy at the Avionics root, RADIOLIB_PATH from deps.cmake) --
+if (NOT EXISTS "${RADIOLIB_PATH}/CMakeLists.txt")
+    message(FATAL_ERROR "RadioLib not found at '${RADIOLIB_PATH}'. "
+            "Set RADIOLIB_PATH to the RadioLib-7.x source directory.")
+endif()
+set(RADIOLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(RADIOLIB_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+add_subdirectory(${RADIOLIB_PATH} ${CMAKE_CURRENT_BINARY_DIR}/radiolib EXCLUDE_FROM_ALL)
+
+add_executable(lora915_tx_test main.cpp)
+
+# PicoHal.h (Pico SDK implementation of RadioLibHal) lives in lora/hal/.
+# rf_csv.h (shared CSV output schema) lives in ../common/.
+target_include_directories(lora915_tx_test PRIVATE
+    ${LORA_ROOT}/hal
+    ${CMAKE_CURRENT_LIST_DIR}/../common
+)
+
+target_link_libraries(lora915_tx_test
+    RadioLib
+    pico_stdlib
+    hardware_spi
+    hardware_gpio
+)
+
+# USB serial for printf(); no UART.
+pico_enable_stdio_usb(lora915_tx_test 1)
+pico_enable_stdio_uart(lora915_tx_test 0)
+
+pico_set_program_name(lora915_tx_test "lora915_tx_test")
+pico_set_program_version(lora915_tx_test "0.1")
+
+pico_add_extra_outputs(lora915_tx_test)
