@@ -7,7 +7,7 @@
 // One CSV row per event. Status / boot lines are printed separately as "# ..."
 // comments so the parser can skip them.
 //
-// Columns (18):
+// Columns (19):
 //   timestamp_ms  - Pico boot time in ms (to_ms_since_boot)
 //   role          - "rx" or "tx"
 //   freq_mhz      - carrier frequency (e.g. 915.0, 433.0)
@@ -23,24 +23,64 @@
 //   crc           - cumulative CRC-error count (rx)
 //   per_pct       - cumulative packet-error rate % (rx)
 //   air_ms        - on-air time for a transmit (tx)
-//   gps_lat       - reserved for future GPS logging (blank)
-//   gps_lon       - reserved for future GPS logging (blank)
-//   gps_alt_m     - reserved for future GPS logging (blank)
+//   gps_lat       - latitude from the UART0 GPS, deg (blank until first fix)
+//   gps_lon       - longitude from the UART0 GPS, deg (blank until first fix)
+//   gps_alt_m     - MSL altitude from the UART0 GPS, m (blank until first fix)
+//   utc           - UTC timestamp "YYYY-MM-DDTHH:MM:SSZ" from the GPS (blank
+//                   until the time is resolved)
+//
+// The gps_* / utc columns are stamped from the latest fix supplied via
+// rf_csv_set_gps() (see rf_gps.h / gps_task.h). They stay blank on tools/boots
+// with no GPS attached.
 #pragma once
+
+#include "rf_gps.h"
 
 #include <cstdio>
 #include <cmath>
+#include <cstring>
+
+// Optional output sink. Every emitted line is always written to stdout (USB
+// serial); if a sink is registered it also receives the same line. rf_log.h
+// provides rf_log_write() for mirroring the stream into a flash file.
+typedef void ( *rf_csv_sink_t )( const char* line );
+
+static rf_csv_sink_t s_rf_csv_sink = nullptr;
+
+static inline void rf_csv_set_sink( rf_csv_sink_t sink )
+{
+    s_rf_csv_sink = sink;
+}
+
+// Latest GPS fix to stamp onto subsequent rows. The main loop refreshes this
+// from the GPS task once per iteration; rows emitted before any fix carry blank
+// gps_*/utc columns.
+static RfGps s_rf_gps = {};
+
+static inline void rf_csv_set_gps( const RfGps& fix )
+{
+    s_rf_gps = fix;
+}
+
+// Emit one fully-formed line (newline included) to stdout and the sink.
+static inline void rf_csv_emit( const char* line )
+{
+    fputs( line, stdout );
+    if ( s_rf_csv_sink ) {
+        s_rf_csv_sink( line );
+    }
+}
 
 static inline void rf_csv_header( void )
 {
-    printf( "timestamp_ms,role,freq_mhz,modulation,event,seq,len_bytes,"
-            "rssi_dbm,snr_db,ferr_hz,good,lost,crc,per_pct,air_ms,"
-            "gps_lat,gps_lon,gps_alt_m\n" );
+    rf_csv_emit( "timestamp_ms,role,freq_mhz,modulation,event,seq,len_bytes,"
+                 "rssi_dbm,snr_db,ferr_hz,good,lost,crc,per_pct,air_ms,"
+                 "gps_lat,gps_lon,gps_alt_m,utc\n" );
 }
 
 // Emit one CSV row. Blank a field by passing a negative integer (seq/len/good/
-// lost/crc/air) or NAN (rssi/snr/ferr/per). The three gps_* columns are always
-// left blank for now.
+// lost/crc/air) or NAN (rssi/snr/ferr/per). The gps_*/utc columns are filled
+// from the snapshot set via rf_csv_set_gps() (blank until the first fix).
 static inline void rf_csv_row( unsigned long ts_ms,
                                const char* role, float freq_mhz, const char* mod,
                                const char* event,
@@ -64,9 +104,24 @@ static inline void rf_csv_row( unsigned long ts_ms,
     if ( std::isnan( ferr ) ) b_ferr[0] = '\0'; else snprintf( b_ferr, sizeof b_ferr, "%.0f", (double)ferr );
     if ( std::isnan( per )  ) b_per[0]  = '\0'; else snprintf( b_per,  sizeof b_per,  "%.1f", (double)per );
 
-    // 15 value columns + 3 blank gps columns (trailing ",,,").
-    printf( "%lu,%s,%.1f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,,,\n",
-            ts_ms, role, (double)freq_mhz, mod, event,
-            b_seq, b_len, b_rssi, b_snr, b_ferr,
-            b_good, b_lost, b_crc, b_per, b_air );
+    // GPS columns from the latest fix snapshot — blank when unavailable.
+    char b_lat[20], b_lon[20], b_alt[16];
+    if ( s_rf_gps.has_pos ) {
+        snprintf( b_lat, sizeof b_lat, "%.7f", s_rf_gps.lat );
+        snprintf( b_lon, sizeof b_lon, "%.7f", s_rf_gps.lon );
+        snprintf( b_alt, sizeof b_alt, "%.1f", (double)s_rf_gps.alt_m );
+    } else {
+        b_lat[0] = b_lon[0] = b_alt[0] = '\0';
+    }
+    const char* utc = s_rf_gps.has_time ? s_rf_gps.utc : "";
+
+    // 15 value columns + gps_lat,gps_lon,gps_alt_m + utc.
+    char line[288];
+    snprintf( line, sizeof line,
+              "%lu,%s,%.1f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+              ts_ms, role, (double)freq_mhz, mod, event,
+              b_seq, b_len, b_rssi, b_snr, b_ferr,
+              b_good, b_lost, b_crc, b_per, b_air,
+              b_lat, b_lon, b_alt, utc );
+    rf_csv_emit( line );
 }

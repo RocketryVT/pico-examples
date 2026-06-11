@@ -60,6 +60,9 @@ set(RADIOLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(RADIOLIB_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 add_subdirectory(${RADIOLIB_PATH} ${CMAKE_CURRENT_BINARY_DIR}/radiolib EXCLUDE_FROM_ALL)
 
+# -- littlefs file logging (flash block device + rf_log + CSV schema) ----------
+include(${CMAKE_CURRENT_LIST_DIR}/../common/radio_common.cmake)
+
 add_executable(rfm69_433_rx_test main.cpp)
 
 # PicoHal.h (Pico SDK implementation of RadioLibHal) lives in lora/hal/.
@@ -74,6 +77,7 @@ target_link_libraries(rfm69_433_rx_test
     pico_stdlib
     hardware_spi
     hardware_gpio
+    radio_common
 )
 
 # USB serial for printf(); no UART.

@@ -15,6 +15,9 @@
 #include <RadioLib.h>
 
 #include "rf_csv.h"         // common CSV output schema (../common/)
+#include "rf_log.h"         // mirror the CSV stream into on-chip flash (../common/)
+#include "gps_task.h"       // UART0 u-blox GPS — UTC + position stamping (../common/)
+#include "rf_console.h"     // USB "list" / "export" command console (../common/)
 
 #include <cstdio>
 #include <cstring>
@@ -83,6 +86,16 @@ int main()
         while ( true ) { sleep_ms( 1000 ); }
     }
     printf( "# [tx] SX1276 ready. Transmitting...\n" );
+
+    // Mount the flash filesystem and mirror every CSV row into a fresh file.
+    if ( rf_log_init( ROLE ) ) {
+        rf_csv_set_sink( rf_log_write );
+    }
+
+    // Bring up the UART0 GPS and auto-configure UBX NAV-PVT (stamps utc/gps_*).
+    gps_task_init();
+
+    printf( "# console: type 'list' or 'export <n>' (or 'help') over USB serial\n" );
     rf_csv_header();
 
     char     msg[64];
@@ -98,13 +111,26 @@ int main()
         const uint32_t t1  = to_ms_since_boot( get_absolute_time() );
         const uint32_t air = t1 - t0;
 
+        // Stamp the freshest GPS fix onto this beacon's row.
+        gps_task_poll();
+        rf_csv_set_gps( gps_task_fix() );
+
         rf_csv_row( t1, ROLE, FREQ_MHZ, MOD,
                     ( state == RADIOLIB_ERR_NONE ) ? "tx_ok" : "tx_fail",
                     (long)count, (long)len,
                     NAN, NAN, NAN, -1, -1, -1, NAN, (long)air );
 
+        rf_log_sync();   // flush this row to flash before the next beacon.
+
         ++count;
-        sleep_ms( 1000 );
+        // Wait ~1 s before the next beacon, servicing the GPS and USB console
+        // throughout so the GPS UART FIFO doesn't overflow and commands stay
+        // responsive between transmits.
+        for ( int i = 0; i < 100; ++i ) {
+            gps_task_poll();
+            rf_console_poll();
+            sleep_ms( 10 );
+        }
     }
 
     return 0;
