@@ -6,16 +6,16 @@
 // disabled, which is only safe because nothing else (no other core, no ISR) is
 // executing from flash at the same time. Polling here costs microseconds.
 //
-// Wiring (Pico 2 W UART0, free in every example — radios use SPI0/SPI1):
-//   GPIO 0 (phys 1)  = UART0 TX -> GPS RX   (carries the UBX config)
-//   GPIO 1 (phys 2)  = UART0 RX <- GPS TX   (carries NAV-PVT)
-//   plus GND and 3V3 to the module.
+// Wiring is supplied by each board/example:
+//   tx_pin = Pico UART0 TX -> GPS RX   (carries the UBX config)
+//   rx_pin = Pico UART0 RX <- GPS TX   (carries NAV-PVT)
+//   plus GND and 3V3/5V to the module.
 //
 // On gps_task_init() the module is auto-configured to emit UBX NAV-PVT only
 // (NMEA silenced) at 1 Hz — see gps_task.cpp.
 //
 // Usage (see any main.cpp):
-//   gps_task_init();                       // UART0 + configure NAV-PVT
+//   gps_task_init( tx_pin, rx_pin, baud ); // UART0 + configure NAV-PVT
 //   ...
 //   for (;;) {
 //       gps_task_poll();                   // drain UART, decode fixes
@@ -26,14 +26,17 @@
 
 #include "rf_gps.h"
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Bring up UART0 and push the UBX NAV-PVT configuration to the module. Prints a
-// "# [gps]" status comment. Returns true on success (always true unless the
-// UART can't be brought up; absence of a module just means no fixes arrive).
-bool gps_task_init( void );
+// Bring up UART0 on the supplied board pins/baud and push the UBX NAV-PVT
+// configuration to the module. Prints a "# [gps]" status comment. Returns true
+// on success (always true unless the UART can't be brought up; absence of a
+// module just means no fixes arrive).
+bool gps_task_init( uint8_t tx_pin, uint8_t rx_pin, uint32_t baud );
 
 // Drain the UART and decode any complete UBX frames. Call every loop iteration.
 void gps_task_poll( void );

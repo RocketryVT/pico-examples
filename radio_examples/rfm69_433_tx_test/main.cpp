@@ -47,6 +47,11 @@ static constexpr bool     HIGH_POWER = true;   // RFM69HCW PA-boost variant
 static constexpr const char* ROLE = "tx";
 static constexpr const char* MOD  = "gfsk";
 
+// GPS wiring for this board.
+static constexpr uint8_t  GPS_TX_PIN = 0;       // Pico TX -> GPS RX
+static constexpr uint8_t  GPS_RX_PIN = 1;       // Pico RX <- GPS TX
+static constexpr uint32_t GPS_BAUD   = 115200;  // Flywoo GM10 Nano V3.1 default
+
 // HAL + radio. Declared static/global because RadioLib keeps internal pointers
 // into the HAL and Module objects.
 static PicoHal hal( spi1, static_cast<uint8_t>( PIN_SCK ),
@@ -116,7 +121,7 @@ int main()
     }
 
     // Bring up the UART0 GPS and auto-configure UBX NAV-PVT (stamps utc/gps_*).
-    gps_task_init();
+    gps_task_init( GPS_TX_PIN, GPS_RX_PIN, GPS_BAUD );
 
     printf( "# console: type 'list' or 'export <n>' (or 'help') over USB serial\n" );
     rf_csv_header();

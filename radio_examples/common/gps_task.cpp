@@ -15,17 +15,22 @@
 
 namespace {
 
-// -- UART0 wiring + link config -----------------------------------------------
-constexpr uint     GPS_TX_PIN = 0;     // GPIO 0 — UART0 TX -> GPS RX
-constexpr uint     GPS_RX_PIN = 1;     // GPIO 1 — UART0 RX <- GPS TX
-constexpr uint32_t GPS_BAUD   = 9600;  // u-blox factory default
+// -- UART0 link config ---------------------------------------------------------
 constexpr uint16_t GPS_RATE_MS = 1000; // 1 Hz navigation solution
+constexpr uint32_t GPS_DIAG_MS = 5000; // low-rate "why are fields blank?" hint
+
+struct GpsTaskConfig {
+    uint8_t  tx_pin = 0;      // Pico UART0 TX -> GPS RX
+    uint8_t  rx_pin = 1;      // Pico UART0 RX <- GPS TX
+    uint32_t baud   = 115200;
+};
 
 // The driver owns the transport by reference, so both must outlive every poll.
 // Constructed in gps_task_init() (not at static-init time) because UartTransport
 // touches hardware that isn't ready until clocks/stdio are up.
 std::optional<gps::UartTransport>                 g_uart;
 std::optional<gps::GpsDriver<gps::UartTransport>> g_driver;
+GpsTaskConfig g_config;
 bool g_ready = false;
 
 // Build the CSV snapshot from the driver's current Coordinate.
@@ -63,28 +68,28 @@ RfGps snapshot()
 
 }  // namespace
 
-bool gps_task_init( void )
+bool gps_task_init( uint8_t tx_pin, uint8_t rx_pin, uint32_t baud )
 {
-    g_uart.emplace( uart0, GPS_TX_PIN, GPS_RX_PIN, GPS_BAUD );
+    g_config = GpsTaskConfig{ .tx_pin = tx_pin, .rx_pin = rx_pin, .baud = baud };
+    g_uart.emplace( uart0, g_config.tx_pin, g_config.rx_pin, g_config.baud );
     g_driver.emplace( *g_uart );
 
-    // Auto-configure: UBX in/out, NMEA silenced, NAV-PVT enabled at 1 Hz.
-    // Keep the module's UART1 at GPS_BAUD so it matches the Pico UART we opened
-    // (the convenience configure() overload would default it to 38400 and break
-    // the link). CFG-PRT is sent at the current baud, which the module already
-    // uses at power-up, so it is received correctly before any baud change.
-    g_driver->configure( gps::GpsDriver<gps::UartTransport>::ConfigOptions{
-        .port         = gps::Port::UART1,
-        .baud         = GPS_BAUD,
-        .in_proto     = gps::InProto::UBX | gps::InProto::NMEA,
-        .out_proto    = gps::OutProto::UBX,
-        .meas_rate_ms = GPS_RATE_MS,
-    } );
-    sleep_ms( 100 );  // let the module apply the config before we poll.
+    // Auto-configure M10-style receivers the same way as the ground-station GPS
+    // task. The older CFG-PRT/CFG-MSG sequence is not reliable on these modules.
+    g_driver->send_ubx( gps::Ubx::valset_uart1_inprot_ubx( true ) );
+    g_driver->send_ubx( gps::Ubx::valset_uart1_inprot_nmea( true ) );
+    g_driver->send_ubx( gps::Ubx::valset_uart1_outprot_ubx( true ) );
+    g_driver->send_ubx( gps::Ubx::valset_uart1_outprot_nmea( false ) );
+    g_driver->send_ubx( gps::Ubx::valset_nav_pvt_uart1( 1 ) );
+    g_driver->send_ubx( gps::Ubx::valset_rate_meas( GPS_RATE_MS ) );
+    g_driver->send_ubx( gps::Ubx::valset_dyn_model( 2 ) );  // stationary bench test
+    sleep_ms( 200 );  // let the module apply the config before we poll.
 
     g_ready = true;
     printf( "# [gps] UART0 @ %lu baud on GPIO%u/%u — UBX NAV-PVT @ %u ms\n",
-            (unsigned long)GPS_BAUD, GPS_TX_PIN, GPS_RX_PIN,
+            (unsigned long)g_config.baud,
+            (unsigned)g_config.tx_pin,
+            (unsigned)g_config.rx_pin,
             (unsigned)GPS_RATE_MS );
     return true;
 }
@@ -93,7 +98,23 @@ void gps_task_poll( void )
 {
     if ( g_ready ) {
         // Module is configured UBX-out only, but tolerate stray NMEA at startup.
-        g_driver->poll();
+        const size_t n = g_driver->poll();
+
+        static uint32_t last_diag_ms = 0;
+        const uint32_t now = to_ms_since_boot( get_absolute_time() );
+        if ( now - last_diag_ms >= GPS_DIAG_MS ) {
+            last_diag_ms = now;
+            const auto& d = g_driver->diagnostics();
+            if ( !g_driver->has_fix() ) {
+                printf( "# [gps] no fix yet: read=%uB ubx_pvt=%lu nmea=%lu bad_nmea=%lu fix=%.*s\n",
+                        (unsigned)n,
+                        (unsigned long)d.ubx_pvt,
+                        (unsigned long)d.nmea_good,
+                        (unsigned long)d.nmea_bad_cksum,
+                        (int)g_driver->fix_label().size(),
+                        g_driver->fix_label().data() );
+            }
+        }
     }
 }
 

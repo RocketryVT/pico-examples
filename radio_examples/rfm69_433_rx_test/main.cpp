@@ -50,6 +50,11 @@ static constexpr uint16_t PREAMBLE  = 16;      // preamble length in bits
 static constexpr const char* ROLE = "rx";
 static constexpr const char* MOD  = "gfsk";
 
+// GPS wiring for this board.
+static constexpr uint8_t  GPS_TX_PIN = 0;       // Pico TX -> GPS RX
+static constexpr uint8_t  GPS_RX_PIN = 1;       // Pico RX <- GPS TX
+static constexpr uint32_t GPS_BAUD   = 115200;  // Flywoo GM10 Nano V3.1 default
+
 // HAL + radio. Declared static/global because RadioLib keeps internal pointers
 // into the HAL and Module objects.
 static PicoHal hal( spi1, static_cast<uint8_t>( PIN_SCK ),
@@ -89,11 +94,13 @@ int main()
 {
     stdio_init_all();
 
-    // Wait for the USB CDC host so we don't lose the early log lines.
-    while ( !stdio_usb_connected() ) {
+    // Give a USB host a brief window to attach so we don't lose the early log
+    // lines — but never *require* it. Logging is mirrored to flash and the
+    // radio runs headless, so bail out after ~2 s if nobody's connected.
+    for ( int i = 0; i < 20 && !stdio_usb_connected(); ++i ) {
         sleep_ms( 100 );
     }
-    sleep_ms( 500 );
+    sleep_ms( 200 );
 
     // The RFM69 is gated behind a power-enable MOSFET — turn it on and let the
     // supply settle before talking to the chip.
@@ -120,7 +127,7 @@ int main()
     }
 
     // Bring up the UART0 GPS and auto-configure UBX NAV-PVT (stamps utc/gps_*).
-    gps_task_init();
+    gps_task_init( GPS_TX_PIN, GPS_RX_PIN, GPS_BAUD );
 
     printf( "# console: type 'list' or 'export <n>' (or 'help') over USB serial\n" );
     rf_csv_header();
