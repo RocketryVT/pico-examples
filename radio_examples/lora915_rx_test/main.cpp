@@ -26,7 +26,11 @@
 #include "rf_payload.h"     // binary TX telemetry payload (../common/)
 #include "rf_log.h"         // mirror the CSV stream into on-chip flash (../common/)
 #include "gps_task.h"       // UART0 u-blox GPS — UTC + position stamping (../common/)
-#include "rf_console.h"     // USB "list" / "export" command console (../common/)
+#include "rf_console.h"     // USB console task + log_print() (../common/)
+#include "rtos.h"           // FreeRTOS task helpers (../common/)
+
+#include "FreeRTOS.h"
+#include "task.h"
 
 #include <cstdio>
 #include <cstring>
@@ -73,6 +77,14 @@ static PicoHal hal( spi0, static_cast<uint8_t>( PIN_SCK ),
 static Module  module_( &hal, PIN_NSS, PIN_DIO0, PIN_RST, RADIOLIB_NC );
 static SX1276  radio( &module_ );
 
+// FreeRTOS task priorities (console runs at tskIDLE_PRIORITY+1 internally).
+// GPS above radio so the UART ring is drained promptly.
+static constexpr UBaseType_t GPS_TASK_PRIORITY   = 3;
+static constexpr UBaseType_t RADIO_TASK_PRIORITY = 2;
+
+static StaticTask_t s_radio_tcb;
+static StackType_t  s_radio_stack[4096];
+
 void run_ucenter_uart_relay()
 {
     stdio_init_all();
@@ -104,33 +116,20 @@ void run_ucenter_uart_relay()
     }
 }
 
-int main()
+// -- Radio task: SX1276 init + continuous-receive loop (core 1) ---------------
+static void radio_task( void* )
 {
-    if constexpr ( UCENTER_UART_RELAY ) {
-        run_ucenter_uart_relay();
-    }
-
-    stdio_init_all();
-
-    // Give a USB host a brief window to attach so we don't lose the early log
-    // lines — but never *require* it. Logging is mirrored to flash and the
-    // radio runs headless, so bail out after ~2 s if nobody's connected.
-    for ( int i = 0; i < 20 && !stdio_usb_connected(); ++i ) {
-        sleep_ms( 100 );
-    }
-    sleep_ms( 200 );
-
     // The LoRa0 radio is gated behind a power-enable MOSFET — turn it on and
     // let the supply settle before talking to the chip.
     gpio_init( PIN_EN );
     gpio_set_dir( PIN_EN, GPIO_OUT );
     gpio_put( PIN_EN, 1 );
-    printf( "# [rx] power enabled (GPIO%u), settling 1 s...\n", PIN_EN );
-    sleep_ms( 1000 );
+    log_print( "# [rx] power enabled (GPIO%u), settling 1 s...\n", PIN_EN );
+    vTaskDelay( pdMS_TO_TICKS( 1000 ) );
 
-    printf( "# [rx] init SX1276 @ %.1f MHz SF%u BW%.0f kHz CR4/%u sync=0x%02X\n",
-            (double)FREQ_MHZ, (unsigned)SF, (double)BW_KHZ,
-            (unsigned)CR, (unsigned)SYNC_WORD );
+    log_print( "# [rx] init SX1276 @ %.1f MHz SF%u BW%.0f kHz CR4/%u sync=0x%02X\n",
+               (double)FREQ_MHZ, (unsigned)SF, (double)BW_KHZ,
+               (unsigned)CR, (unsigned)SYNC_WORD );
 
     ConfigLoRa_t cfg;
     cfg.frequency       = FREQ_MHZ;
@@ -143,24 +142,10 @@ int main()
 
     int state = radio.begin( cfg );
     if ( state != RADIOLIB_ERR_NONE ) {
-        printf( "# [rx] begin() failed, code %d — check wiring/power. Halting.\n", state );
-        while ( true ) { sleep_ms( 1000 ); }
+        log_print( "# [rx] begin() failed, code %d — check wiring/power.\n", state );
+        for ( ;; ) { vTaskDelay( pdMS_TO_TICKS( 1000 ) ); }
     }
-    printf( "# [rx] SX1276 ready. Listening...\n" );
-
-    // Mount the flash filesystem and mirror every CSV row into a fresh file.
-    if ( rf_log_init( ROLE ) ) {
-        rf_csv_set_sink( rf_log_write );
-    }
-
-    // Bring up UART0 GPS in listen-only mode. The GM10/M10050 stream verified
-    // in u-center already emits valid NMEA fixes; do not send UBX config here.
-    gps_task_init_autobaud_listen_only( RADIO_GPS_TX_PIN, RADIO_GPS_RX_PIN, RADIO_GPS_BAUD );
-    gps_task_set_nav_pvt_debug( true );
-
-    printf( "# console: type 'list' or 'export <n>' (or 'help') over USB serial\n" );
-    printf( "# [rx] live CSV rows suppressed; use 'export <n>' for CSV logs\n" );
-    rf_csv_set_stdout_enabled( false );
+    log_print( "# [rx] SX1276 ready. Listening...\n" );
     rf_csv_header();
 
     // Continuous receive; DIO0 goes high on RxDone in LoRa mode.
@@ -183,12 +168,9 @@ int main()
     for ( ;; ) {
         const uint32_t now = to_ms_since_boot( get_absolute_time() );
 
-        // Service the GPS and refresh the fix stamped onto this iteration's rows.
-        gps_task_poll();
+        // Refresh the GPS fix stamped onto this iteration's rows (the GPS task
+        // keeps the shared fix current; this just snapshots it).
         rf_csv_set_gps( gps_task_fix() );
-
-        // Handle any USB console command (list / export).
-        rf_console_poll();
 
         // -- Packet arrived? ---------------------------------------------------
         if ( gpio_get( PIN_DIO0 ) ) {
@@ -213,8 +195,8 @@ int main()
                 } else {
                     if ( !warned_legacy_payload ) {
                         warned_legacy_payload = true;
-                        printf( "# [rx] non-RFT2 payload len=%lu; flash updated lora915_tx_test.uf2 for TX GPS fields\n",
-                                (unsigned long)len );
+                        log_print( "# [rx] non-RFT2 payload len=%lu; flash updated lora915_tx_test.uf2 for TX GPS fields\n",
+                                   (unsigned long)len );
                     }
                     buf[( len < sizeof(buf) ) ? len : sizeof(buf) - 1] = '\0';
                     if ( const char* h = strchr( reinterpret_cast<char*>( buf ), '#' ) ) {
@@ -283,8 +265,50 @@ int main()
             rf_log_sync();
         }
 
-        sleep_ms( 5 );
+        vTaskDelay( pdMS_TO_TICKS( 2 ) );
+    }
+}
+
+int main()
+{
+    if constexpr ( UCENTER_UART_RELAY ) {
+        run_ucenter_uart_relay();   // never returns
     }
 
-    return 0;
+    stdio_init_all();
+
+    // Give a USB host a brief window to attach so we don't lose the early log
+    // lines — but never *require* it. These are queued and flushed once the
+    // console task runs.
+    for ( int i = 0; i < 20 && !stdio_usb_connected(); ++i ) {
+        sleep_ms( 100 );
+    }
+    sleep_ms( 200 );
+
+    // Console task first (owns USB; creates the log queue so early log_print()
+    // calls below are captured and flushed once the scheduler runs).
+    rf_console_start();
+
+    // Mount the flash filesystem and mirror every CSV row into a fresh file.
+    if ( rf_log_init( ROLE ) ) {
+        rf_csv_set_sink( rf_log_write );
+    }
+
+    // Bring up UART0 GPS in listen-only mode. The GM10/M10050 stream verified
+    // in u-center already emits valid NMEA fixes; do not send UBX config here.
+    gps_task_init_autobaud_listen_only( RADIO_GPS_TX_PIN, RADIO_GPS_RX_PIN, RADIO_GPS_BAUD );
+    gps_task_set_nav_pvt_debug( true );
+
+    rf_csv_set_stdout_enabled( false );
+    log_print( "# console: 'list' / 'export <n>' / 'live on' (or 'help') over USB\n" );
+    log_print( "# [rx] live CSV rows suppressed; use 'export <n>' or 'live on'\n" );
+
+    // Spawn the GPS task (core 1) and the radio task (core 1), then run.
+    gps_task_start( GPS_TASK_PRIORITY );
+    TaskHandle_t h = rtos_task_create( radio_task, "radio", 4096, nullptr,
+                                       RADIO_TASK_PRIORITY, s_radio_stack, &s_radio_tcb );
+    vTaskCoreAffinitySet( h, 1u << 1 );  // core 1
+
+    vTaskStartScheduler();
+    for ( ;; ) {}
 }

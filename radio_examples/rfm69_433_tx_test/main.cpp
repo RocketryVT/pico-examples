@@ -19,7 +19,11 @@
 #include "rf_csv.h"         // common CSV output schema (../common/)
 #include "rf_log.h"         // mirror the CSV stream into on-chip flash (../common/)
 #include "gps_task.h"       // UART0 u-blox GPS — UTC + position stamping (../common/)
-#include "rf_console.h"     // USB "list" / "export" command console (../common/)
+#include "rf_console.h"     // USB console task + log_print() (../common/)
+#include "rtos.h"           // FreeRTOS task helpers (../common/)
+
+#include "FreeRTOS.h"
+#include "task.h"
 
 #include <cstdio>
 #include <cstring>
@@ -60,6 +64,13 @@ static PicoHal hal( spi1, static_cast<uint8_t>( PIN_SCK ),
 static Module  module_( &hal, PIN_NSS, PIN_DIO0, PIN_RST, RADIOLIB_NC );
 static RF69    radio( &module_ );
 
+// FreeRTOS task priorities (console runs at tskIDLE_PRIORITY+1 internally).
+static constexpr UBaseType_t GPS_TASK_PRIORITY   = 3;
+static constexpr UBaseType_t RADIO_TASK_PRIORITY = 2;
+
+static StaticTask_t s_radio_tcb;
+static StackType_t  s_radio_stack[4096];
+
 // RF69 GFSK + HCW high-power init. Mirrors the ground-station RF69 wrapper:
 // begin() can't set >13 dBm with the PA-boost flag, so cap power at 13 for
 // begin() then re-apply the real power with high_power=true.
@@ -90,40 +101,28 @@ static int radio_init()
     return RADIOLIB_ERR_NONE;
 }
 
-int main()
+// -- Radio task: RFM69 init + 1 Hz beacon loop (core 1) -----------------------
+static void radio_task( void* )
 {
-    stdio_init_all();
-    sleep_ms( 500 );
-
     // The RFM69 is gated behind a power-enable MOSFET — turn it on and let the
     // supply settle before talking to the chip.
     gpio_init( PIN_EN );
     gpio_set_dir( PIN_EN, GPIO_OUT );
     gpio_put( PIN_EN, 1 );
-    printf( "# [tx] power enabled (GPIO%u), settling 1 s...\n", PIN_EN );
-    sleep_ms( 1000 );
+    log_print( "# [tx] power enabled (GPIO%u), settling 1 s...\n", PIN_EN );
+    vTaskDelay( pdMS_TO_TICKS( 1000 ) );
 
-    printf( "# [tx] init RFM69HCW @ %.1f MHz GFSK %.1f kbps fdev=%.1f kHz "
-            "rxbw=%.0f kHz pwr=%d dBm\n",
-            (double)FREQ_MHZ, (double)BR_KBPS, (double)FDEV_KHZ,
-            (double)RXBW_KHZ, (int)TX_DBM );
+    log_print( "# [tx] init RFM69HCW @ %.1f MHz GFSK %.1f kbps fdev=%.1f kHz "
+               "rxbw=%.0f kHz pwr=%d dBm\n",
+               (double)FREQ_MHZ, (double)BR_KBPS, (double)FDEV_KHZ,
+               (double)RXBW_KHZ, (int)TX_DBM );
 
     int state = radio_init();
     if ( state != RADIOLIB_ERR_NONE ) {
-        printf( "# [tx] init failed, code %d — check wiring/power. Halting.\n", state );
-        while ( true ) { sleep_ms( 1000 ); }
+        log_print( "# [tx] init failed, code %d — check wiring/power.\n", state );
+        for ( ;; ) { vTaskDelay( pdMS_TO_TICKS( 1000 ) ); }
     }
-    printf( "# [tx] RFM69HCW ready. Transmitting...\n" );
-
-    // Mount the flash filesystem and mirror every CSV row into a fresh file.
-    if ( rf_log_init( ROLE ) ) {
-        rf_csv_set_sink( rf_log_write );
-    }
-
-    // Bring up the UART0 GPS and auto-configure UBX NAV-PVT (stamps utc/gps_*).
-    gps_task_init( GPS_TX_PIN, GPS_RX_PIN, GPS_BAUD );
-
-    printf( "# console: type 'list' or 'export <n>' (or 'help') over USB serial\n" );
+    log_print( "# [tx] RFM69HCW ready. Transmitting...\n" );
     rf_csv_header();
 
     char     msg[64];
@@ -140,7 +139,6 @@ int main()
         const uint32_t air = t1 - t0;
 
         // Stamp the freshest GPS fix onto this beacon's row.
-        gps_task_poll();
         rf_csv_set_gps( gps_task_fix() );
 
         rf_csv_row( t1, ROLE, FREQ_MHZ, MOD,
@@ -151,15 +149,37 @@ int main()
         rf_log_sync();   // flush this row to flash before the next beacon.
 
         ++count;
-        // Wait ~1 s before the next beacon, servicing the GPS and USB console
-        // throughout so the GPS UART FIFO doesn't overflow and commands stay
-        // responsive between transmits.
-        for ( int i = 0; i < 100; ++i ) {
-            gps_task_poll();
-            rf_console_poll();
-            sleep_ms( 10 );
-        }
+        vTaskDelay( pdMS_TO_TICKS( 1000 ) );   // 1 Hz beacon
+    }
+}
+
+int main()
+{
+    stdio_init_all();
+
+    // Brief, non-blocking window for a USB host to attach.
+    for ( int i = 0; i < 20 && !stdio_usb_connected(); ++i ) {
+        sleep_ms( 100 );
+    }
+    sleep_ms( 200 );
+
+    rf_console_start();
+
+    if ( rf_log_init( ROLE ) ) {
+        rf_csv_set_sink( rf_log_write );
     }
 
-    return 0;
+    // Bring up the UART0 GPS and auto-configure UBX NAV-PVT (stamps utc/gps_*).
+    gps_task_init( GPS_TX_PIN, GPS_RX_PIN, GPS_BAUD );
+
+    rf_csv_set_stdout_enabled( false );
+    log_print( "# console: 'list' / 'export <n>' / 'live on' (or 'help') over USB\n" );
+
+    gps_task_start( GPS_TASK_PRIORITY );
+    TaskHandle_t h = rtos_task_create( radio_task, "radio", 4096, nullptr,
+                                       RADIO_TASK_PRIORITY, s_radio_stack, &s_radio_tcb );
+    vTaskCoreAffinitySet( h, 1u << 1 );  // core 1
+
+    vTaskStartScheduler();
+    for ( ;; ) {}
 }

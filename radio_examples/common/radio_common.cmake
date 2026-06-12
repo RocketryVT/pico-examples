@@ -1,18 +1,28 @@
-# radio_common.cmake — shared file-logging support for the RF bench-test tools.
+# radio_common.cmake — shared FreeRTOS + logging + GPS support for the RF tools.
 #
-# include() this from an example's CMakeLists AFTER pico_sdk_init(), then link
-# the `radio_common` target into the executable. That target pulls in:
-#   * littlefs (lfs.c / lfs_util.c, compiled from LITTLEFS_PATH)
-#   * the Pico on-chip-flash block device (lfs_pico_flash.c)
-#   * the rf_log helper + the rf_csv.h schema include dir
-#   * the UART0 GPS task (gps_task.cpp) + the gps driver library (GPS_ROOT)
+# include() this from an example's CMakeLists AFTER pico_sdk_init(). It defines
+# the littlefs / gps libraries and the FreeRTOS kernel, then exposes three lists
+# the example folds straight into its own executable:
 #
-# Flash split is fixed in lfs_pico_flash.h: the bottom 1 MB of the 4 MB part is
-# the program image, the top 3 MB is the littlefs file region. These tools are
-# tens of kB, so the program never approaches the 1 MB boundary; the split is
-# enforced by the block device's base offset rather than a custom linker script
-# (PICO_FLASH_SIZE_BYTES stays at the board default 4 MB so flash_range_program
-# is allowed to write the upper 3 MB).
+#   ${RADIO_COMMON_SOURCES}  — common .c/.cpp (console, logging, GPS, flash FS,
+#                              CSV, FreeRTOS scaffolding)
+#   ${RADIO_COMMON_INCLUDE}  — the common/ include dir (also holds FreeRTOSConfig.h)
+#   ${RADIO_COMMON_LIBS}     — libraries to link
+#
+# Example:
+#   include(${CMAKE_CURRENT_LIST_DIR}/../common/radio_common.cmake)
+#   add_executable(foo main.cpp ${RADIO_COMMON_SOURCES})
+#   target_include_directories(foo PRIVATE ${RADIO_COMMON_INCLUDE} ...)
+#   target_link_libraries(foo ${RADIO_COMMON_LIBS} RadioLib hardware_spi ...)
+#
+# The common sources are compiled into each executable (rather than a static
+# library) because the FreeRTOS-Kernel port exposes its port.c as INTERFACE
+# sources; routing them through an intermediate static lib would double-compile
+# them into both the lib and the exe and clash at link time.
+#
+# Flash split is fixed in lfs_pico_flash.h: bottom 1 MB program, top 3 MB the
+# littlefs file region. Flash erase/program is made SMP-safe with
+# flash_safe_execute() (pico_flash), which is supported under FreeRTOS SMP.
 
 if (NOT DEFINED LITTLEFS_PATH)
     message(FATAL_ERROR "LITTLEFS_PATH not set — include cmake/deps.cmake first.")
@@ -26,6 +36,21 @@ endif()
 if (NOT EXISTS "${GPS_ROOT}/CMakeLists.txt")
     message(FATAL_ERROR "GPS library not found at '${GPS_ROOT}'.")
 endif()
+if (NOT DEFINED FREERTOS_KERNEL_PATH)
+    message(FATAL_ERROR "FREERTOS_KERNEL_PATH not set — include cmake/deps.cmake first.")
+endif()
+
+# -- FreeRTOS kernel (RP2350 ARM, non-TrustZone, SMP) -------------------------
+# FreeRTOSConfig.h lives in this common/ directory.
+set(FREERTOS_CONFIG_FILE_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}" CACHE INTERNAL "")
+if (NOT TARGET FreeRTOS-Kernel)
+    set(_freertos_import
+        "${FREERTOS_KERNEL_PATH}/portable/ThirdParty/GCC/RP2350_ARM_NTZ/FreeRTOS_Kernel_import.cmake")
+    if (NOT EXISTS "${_freertos_import}")
+        message(FATAL_ERROR "FreeRTOS RP2350 import not found at '${_freertos_import}'.")
+    endif()
+    include(${_freertos_import})
+endif()
 
 # -- littlefs core ------------------------------------------------------------
 if (NOT TARGET littlefs)
@@ -35,9 +60,7 @@ if (NOT TARGET littlefs)
     )
     target_include_directories(littlefs PUBLIC ${LITTLEFS_PATH})
     # Silence littlefs' debug/warn/error printf so they don't pollute the CSV
-    # stream on USB (those lines don't start with '#', so the analysis scripts
-    # in scripts/ would fail to parse them). Errors still surface as lfs_*
-    # return codes, which rf_log handles and reports as "# [log]" comments.
+    # stream. Errors still surface as lfs_* return codes (rf_log reports them).
     target_compile_definitions(littlefs PUBLIC
         LFS_NO_DEBUG
         LFS_NO_WARN
@@ -51,23 +74,30 @@ if (NOT TARGET gps)
     add_subdirectory(${GPS_ROOT} ${CMAKE_BINARY_DIR}/gps)
 endif()
 
-# -- flash block device + CSV file logger + UART0 GPS task --------------------
-if (NOT TARGET radio_common)
-    add_library(radio_common STATIC
-        ${CMAKE_CURRENT_LIST_DIR}/lfs_pico_flash.c
-        ${CMAKE_CURRENT_LIST_DIR}/rf_log.cpp
-        ${CMAKE_CURRENT_LIST_DIR}/gps_task.cpp
-        ${CMAKE_CURRENT_LIST_DIR}/rf_console.cpp
-    )
-    # PUBLIC so consumers also get rf_csv.h / rf_log.h / gps_task.h on their path.
-    target_include_directories(radio_common PUBLIC ${CMAKE_CURRENT_LIST_DIR})
-    target_link_libraries(radio_common PUBLIC
-        littlefs
-        gps
-        pico_stdlib
-        hardware_flash
-        hardware_sync
-        hardware_uart
-        hardware_i2c   # gps_driver.hpp includes hardware/i2c.h (I2cTransport)
-    )
-endif()
+# -- Exported lists for each example to compile into its own executable -------
+set(RADIO_COMMON_SOURCES
+    ${CMAKE_CURRENT_LIST_DIR}/rtos.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/rf_console.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/rf_csv.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/rf_log.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/lfs_pico_flash.c
+    ${CMAKE_CURRENT_LIST_DIR}/gps_task.cpp
+)
+
+set(RADIO_COMMON_INCLUDE
+    ${CMAKE_CURRENT_LIST_DIR}
+)
+
+set(RADIO_COMMON_LIBS
+    littlefs
+    gps
+    pico_stdlib
+    pico_multicore
+    pico_flash
+    hardware_flash
+    hardware_sync
+    hardware_uart
+    hardware_i2c   # gps_driver.hpp includes hardware/i2c.h (I2cTransport)
+    FreeRTOS-Kernel
+    FreeRTOS-Kernel-Heap4
+)

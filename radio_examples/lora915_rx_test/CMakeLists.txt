@@ -66,13 +66,13 @@ add_subdirectory(${RADIOLIB_PATH} ${CMAKE_CURRENT_BINARY_DIR}/radiolib EXCLUDE_F
 # -- littlefs file logging (flash block device + rf_log + CSV schema) ----------
 include(${CMAKE_CURRENT_LIST_DIR}/../common/radio_common.cmake)
 
-add_executable(lora915_rx_test main.cpp)
+add_executable(lora915_rx_test main.cpp ${RADIO_COMMON_SOURCES})
 
 # PicoHal.h (Pico SDK implementation of RadioLibHal) lives in lora/hal/.
 # rf_csv.h (shared CSV output schema) lives in ../common/.
 target_include_directories(lora915_rx_test PRIVATE
     ${LORA_ROOT}/hal
-    ${CMAKE_CURRENT_LIST_DIR}/../common
+    ${RADIO_COMMON_INCLUDE}
 )
 
 target_link_libraries(lora915_rx_test
@@ -80,7 +80,7 @@ target_link_libraries(lora915_rx_test
     pico_stdlib
     hardware_spi
     hardware_gpio
-    radio_common
+    ${RADIO_COMMON_LIBS}
 )
 
 # USB serial for printf(); no UART.

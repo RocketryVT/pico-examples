@@ -14,6 +14,35 @@ comparisons, sanity checks). Each is a self-contained CMake project.
 Pins and air config are copied from the ground-station firmware
 (`projects/ground_station/pico/src/shared.hpp`) so these talk to the real GS.
 
+## Architecture (FreeRTOS SMP)
+
+Each tool runs FreeRTOS SMP across the RP2350's two cores, mirroring the
+ground-station firmware, with three tasks:
+
+- **console task** (core 0) — owns **all** USB serial I/O. No other task touches
+  `printf`/`getchar`. Other tasks enqueue output with `log_print()` /
+  `log_puts()` (see [`common/rf_console.cpp`](common/rf_console.cpp)); the console
+  task drains that queue and prints it, and reads typed commands (`list`,
+  `export`, `format`, `live`, `help`). Pinned to core 0 because the TinyUSB IRQ
+  lives there.
+- **gps task** (core 1) — drains the UART0 RX IRQ ring and parses NMEA/UBX into a
+  mutex-guarded shared fix. Because the UART is serviced by an interrupt and the
+  task is scheduled preemptively, GPS bytes are no longer lost when the radio or
+  flash logger is busy (the root cause of earlier dropped frames).
+- **radio task** (core 1) — the per-tool RX/TX loop. Reads the latest GPS fix via
+  `gps_task_fix()` and emits CSV rows.
+
+Flash logging is made multicore-safe with `flash_safe_execute()` (supported under
+FreeRTOS SMP) so a flash erase/program on one core can't fault the other while it
+executes from XIP; all littlefs access is additionally serialized behind a mutex.
+FreeRTOS config is [`common/FreeRTOSConfig.h`](common/FreeRTOSConfig.h); the
+shared sources/libraries are wired up by
+[`common/radio_common.cmake`](common/radio_common.cmake).
+
+> Note: a flash **erase** briefly halts both cores' interrupts, so a GPS byte or
+> two can still be lost the moment littlefs crosses a block boundary — the parser
+> resyncs on the next sentence, so at most one fix is skipped.
+
 ## Shared output schema
 
 All four emit the same CSV (one row per event) defined in
@@ -37,9 +66,13 @@ Wiring (UART0 is free in every example — the radios use SPI0/SPI1):
 | GPIO 1 (phys 2) | UART0 RX | ← GPS TX |
 | GND / 3V3 | power | — |
 
-The GPS is serviced cooperatively from each tool's super-loop (not a FreeRTOS
-thread or core1) so the flash logger's interrupt-disable flash writes stay safe.
-The columns stay blank with no GPS attached or before the first fix.
+The GPS is serviced by a dedicated FreeRTOS task (core 1) fed by the UART0 RX
+interrupt (see Architecture above). The columns stay blank with no GPS attached
+or before the first fix.
+
+> The GPS UART pins/baud differ per board — e.g. the 915 MHz tools use GPIO 13/12
+> at 230400 in listen-only mode; check the `GPS_*` / `RADIO_GPS_*` constants at
+> the top of each `main.cpp`.
 
 ## On-board file logging (littlefs)
 
@@ -58,8 +91,9 @@ comment is printed over USB at startup.
 The wiring lives in [`common/rf_log.cpp`](common/rf_log.cpp) and is shared by all
 four tools via [`common/radio_common.cmake`](common/radio_common.cmake)
 (`LITTLEFS_PATH` comes from [`cmake/deps.cmake`](../../../cmake/deps.cmake)).
-These are single-core super-loops, so flash writes just disable interrupts — no
-FreeRTOS or multicore lockout needed.
+Under FreeRTOS SMP, flash erase/program goes through `flash_safe_execute()` so the
+other core is parked during the operation, and all littlefs access is serialized
+behind a mutex.
 
 ### Retrieving logs over USB (console)
 
@@ -91,9 +125,10 @@ timestamp_ms,role,freq_mhz,...,utc
 
 The dump is bracketed by `# ---- begin/end export ----` comment lines, so a
 serial capture piped into the `scripts/` loader parses cleanly (it skips `#`
-lines). The console is cooperative — an `export` runs to completion inside one
-loop pass, so live CSV rows never interleave with the dump. The active log can be
-exported too (it is flushed and rewound through its own handle).
+lines). An `export` runs to completion inside the console task while holding the
+filesystem mutex, so the radio task's flash writes pause and no live rows
+interleave with the dump. The active log can be exported too (it is flushed and
+rewound through its own handle).
 
 To pull the raw filesystem image instead, read the 3 MB file region (offset
 `0x100000`) with `picotool save -r 0x10100000 0x10400000 logs.bin` and mount it

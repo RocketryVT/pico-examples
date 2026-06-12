@@ -51,9 +51,17 @@ bool gps_task_init_autobaud( uint8_t tx_pin, uint8_t rx_pin, uint32_t target_bau
 bool gps_task_init_autobaud_listen_only( uint8_t tx_pin, uint8_t rx_pin,
                                          uint32_t preferred_baud );
 
-// Drain the UART ring and decode any complete NMEA/UBX frames. Call every loop
-// iteration.
+// Drain the UART ring and decode any complete NMEA/UBX frames once. Normally
+// you do NOT call this directly under FreeRTOS — gps_task_start() spawns a task
+// that calls it continuously. Kept public for non-RTOS / test use.
 void gps_task_poll( void );
+
+// Spawn the FreeRTOS GPS task (pinned to core 1) that continuously drains the
+// UART IRQ ring and parses NMEA/UBX into the shared fix. Call after one of the
+// gps_task_init* functions and before vTaskStartScheduler(). `priority` is the
+// FreeRTOS task priority (use a value above the radio task so GPS is serviced
+// promptly).
+void gps_task_start( unsigned priority );
 
 // Print each valid UBX NAV-PVT frame as one '#'-prefixed raw hex line. This is
 // for GPS debugging on the USB console; decoded CSV logging is unchanged.

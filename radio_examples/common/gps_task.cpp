@@ -1,6 +1,8 @@
 // gps_task.cpp — see gps_task.h.
 
 #include "gps_task.h"
+#include "rf_console.h"   // log_print() — all USB output goes via the console task
+#include "rtos.h"
 
 // Pico headers first: gps_driver.hpp only compiles its UART/I2C transport
 // wrappers when PICO_SDK_VERSION_MAJOR is already defined (pico/version.h,
@@ -9,12 +11,44 @@
 #include "pico/version.h"
 #include "hardware/irq.h"
 
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
+
 #include "gps/gps_driver.hpp"
 
 #include <cstdio>
 #include <optional>
 
 namespace {
+
+// Guards the parser/coordinate state shared between the GPS task (feed/parse)
+// and any task reading a fix snapshot (gps_task_fix). Created in gps_task_start.
+SemaphoreHandle_t g_gps_mutex = nullptr;
+StaticSemaphore_t g_gps_mutex_buf;
+
+bool gps_sched_running()
+{
+    return xTaskGetSchedulerState() == taskSCHEDULER_RUNNING;
+}
+
+void gps_lock()
+{
+    if ( g_gps_mutex && gps_sched_running() ) {
+        xSemaphoreTake( g_gps_mutex, portMAX_DELAY );
+    }
+}
+
+void gps_unlock()
+{
+    if ( g_gps_mutex && gps_sched_running() ) {
+        xSemaphoreGive( g_gps_mutex );
+    }
+}
+
+// GPS task storage.
+StaticTask_t g_gps_tcb;
+StackType_t  g_gps_stack[2048];
 
 // -- UART0 link config ---------------------------------------------------------
 constexpr uint16_t GPS_RATE_MS = 1000; // 1 Hz navigation solution
@@ -228,18 +262,31 @@ bool detect_listen_only_stream( uint32_t wait_ms, bool* saw_nmea )
     return saw_ubx;
 }
 
+// Append " %02X" hex for up to `cap` bytes into a caller buffer.
+size_t append_hex( char* dst, size_t dst_len, size_t pos,
+                   const uint8_t* b, size_t count, size_t cap )
+{
+    for ( size_t i = 0; i < count && i < cap && pos + 4 < dst_len; ++i ) {
+        pos += (size_t)snprintf( dst + pos, dst_len - pos, " %02X", b[i] );
+    }
+    return pos;
+}
+
 void print_raw_sample( const uint8_t* sample, size_t count )
 {
-    printf( "# [gps] raw hex:" );
-    for ( size_t i = 0; i < count; ++i ) {
-        printf( " %02X", sample[i] );
-    }
-    printf( "\n# [gps] raw ascii: " );
-    for ( size_t i = 0; i < count; ++i ) {
+    char line[384];
+    size_t pos = (size_t)snprintf( line, sizeof line, "# [gps] raw hex:" );
+    pos = append_hex( line, sizeof line, pos, sample, count, 48 );
+    log_print( "%s", line );
+
+    char ascii[80];
+    size_t ap = (size_t)snprintf( ascii, sizeof ascii, "# [gps] raw ascii: " );
+    for ( size_t i = 0; i < count && i < 48 && ap + 1 < sizeof ascii; ++i ) {
         const uint8_t c = sample[i];
-        putchar( ( c >= 32 && c <= 126 ) ? c : '.' );
+        ascii[ap++] = ( c >= 32 && c <= 126 ) ? (char)c : '.';
     }
-    putchar( '\n' );
+    ascii[ap] = '\0';
+    log_print( "%s", ascii );
 }
 
 void print_raw_uart_chunk( const uint8_t* sample, size_t count )
@@ -248,29 +295,25 @@ void print_raw_uart_chunk( const uint8_t* sample, size_t count )
         return;
     }
 
-    printf( "# [gps] raw-uart n=%lu len=%u hex:",
-            (unsigned long)g_raw_chunk_count++,
-            (unsigned)count );
-    for ( size_t i = 0; i < count; ++i ) {
-        printf( " %02X", sample[i] );
-    }
-    putchar( '\n' );
+    char line[384];
+    size_t pos = (size_t)snprintf( line, sizeof line, "# [gps] raw-uart n=%lu len=%u hex:",
+                                   (unsigned long)g_raw_chunk_count++, (unsigned)count );
+    pos = append_hex( line, sizeof line, pos, sample, count, 100 );
+    log_print( "%s", line );
 }
 
 void print_nav_pvt_frame( const uint8_t* frame, size_t count )
 {
     const gps::Coordinate& c = g_driver->coordinate();
-    printf( "# [gps] nav-pvt raw n=%lu len=%u fix=%.*s sats=%d hAcc=%.1fm hex:",
-            (unsigned long)g_tap_nav_pvt_frames,
-            (unsigned)count,
-            (int)g_driver->fix_label().size(),
-            g_driver->fix_label().data(),
-            c.satellites,
-            (double)c.h_acc_mm / 1000.0 );
-    for ( size_t i = 0; i < count; ++i ) {
-        printf( " %02X", frame[i] );
-    }
-    putchar( '\n' );
+    char line[384];
+    size_t pos = (size_t)snprintf(
+        line, sizeof line,
+        "# [gps] nav-pvt raw n=%lu len=%u fix=%.*s sats=%d hAcc=%.1fm hex:",
+        (unsigned long)g_tap_nav_pvt_frames, (unsigned)count,
+        (int)g_driver->fix_label().size(), g_driver->fix_label().data(),
+        c.satellites, (double)c.h_acc_mm / 1000.0 );
+    pos = append_hex( line, sizeof line, pos, frame, count, 100 );
+    log_print( "%s", line );
 }
 
 void print_ubx_frame( const uint8_t* frame, size_t count, uint8_t cls, uint8_t id,
@@ -289,15 +332,14 @@ void print_ubx_frame( const uint8_t* frame, size_t count, uint8_t cls, uint8_t i
     }
     ++g_tap_other_prints;
 
-    printf( "# [gps] ubx raw n=%lu cls=0x%02X id=0x%02X payload_len=%u hex:",
-            (unsigned long)g_tap_ubx_frames,
-            (unsigned)cls,
-            (unsigned)id,
-            (unsigned)length );
-    for ( size_t i = 0; i < count; ++i ) {
-        printf( " %02X", frame[i] );
-    }
-    putchar( '\n' );
+    char line[384];
+    size_t pos = (size_t)snprintf(
+        line, sizeof line,
+        "# [gps] ubx raw n=%lu cls=0x%02X id=0x%02X payload_len=%u hex:",
+        (unsigned long)g_tap_ubx_frames, (unsigned)cls, (unsigned)id,
+        (unsigned)length );
+    pos = append_hex( line, sizeof line, pos, frame, count, 100 );
+    log_print( "%s", line );
 }
 
 void tap_nav_pvt_byte( uint8_t b )
@@ -451,6 +493,7 @@ RfGps snapshot()
         return out;
     }
 
+    gps_lock();
     const uint32_t now = to_ms_since_boot( get_absolute_time() );
     const bool fresh_frames = g_last_frame_ms != 0 &&
                               ( now - g_last_frame_ms ) <= GPS_STALE_MS;
@@ -479,6 +522,7 @@ RfGps snapshot()
         out.has_time = true;
     }
 
+    gps_unlock();
     return out;
 }
 
@@ -492,7 +536,7 @@ bool gps_task_init( uint8_t tx_pin, uint8_t rx_pin, uint32_t baud )
 
     g_ready = true;
     enable_uart_rx_irq();
-    printf( "# [gps] UART0 @ %lu baud on GPIO%u/%u — UBX NAV-PVT @ %u ms\n",
+    log_print( "# [gps] UART0 @ %lu baud on GPIO%u/%u — UBX NAV-PVT @ %u ms\n",
             (unsigned long)g_config.baud,
             (unsigned)g_config.tx_pin,
             (unsigned)g_config.rx_pin,
@@ -513,7 +557,7 @@ bool gps_task_init_autobaud( uint8_t tx_pin, uint8_t rx_pin, uint32_t target_bau
         if ( detect_valid_stream( 1200 ) ) {
             current_baud = baud;
             const auto& d = g_driver->diagnostics();
-            printf( "# [gps] detected UART0 @ %lu baud (ubx=%lu nmea=%lu)\n",
+            log_print( "# [gps] detected UART0 @ %lu baud (ubx=%lu nmea=%lu)\n",
                     (unsigned long)current_baud,
                     (unsigned long)d.ubx_frames,
                     (unsigned long)d.nmea_good );
@@ -522,13 +566,13 @@ bool gps_task_init_autobaud( uint8_t tx_pin, uint8_t rx_pin, uint32_t target_bau
     }
 
     if ( current_baud == 0 ) {
-        printf( "# [gps] autobaud failed; trying target baud %lu directly\n",
+        log_print( "# [gps] autobaud failed; trying target baud %lu directly\n",
                 (unsigned long)target_baud );
         return gps_task_init( tx_pin, rx_pin, target_baud );
     }
 
     if ( current_baud != target_baud ) {
-        printf( "# [gps] switching UART1 baud %lu -> %lu\n",
+        log_print( "# [gps] switching UART1 baud %lu -> %lu\n",
                 (unsigned long)current_baud,
                 (unsigned long)target_baud );
         g_driver->send_ubx( gps::Ubx::valset_uart1_baud( target_baud ) );
@@ -540,7 +584,7 @@ bool gps_task_init_autobaud( uint8_t tx_pin, uint8_t rx_pin, uint32_t target_bau
 
     g_ready = true;
     enable_uart_rx_irq();
-    printf( "# [gps] UART0 @ %lu baud on GPIO%u/%u — UBX NAV-PVT @ %u ms\n",
+    log_print( "# [gps] UART0 @ %lu baud on GPIO%u/%u — UBX NAV-PVT @ %u ms\n",
             (unsigned long)g_config.baud,
             (unsigned)g_config.tx_pin,
             (unsigned)g_config.rx_pin,
@@ -567,7 +611,7 @@ bool gps_task_init_autobaud_listen_only( uint8_t tx_pin, uint8_t rx_pin,
         if ( detect_listen_only_stream( 1600, &saw_nmea ) ) {
             current_baud = baud;
             const auto& d = g_driver->diagnostics();
-            printf( "# [gps] listen-only UART0 @ %lu baud on GPIO%u/%u (ubx=%lu nmea=%lu source=%s)\n",
+            log_print( "# [gps] listen-only UART0 @ %lu baud on GPIO%u/%u (ubx=%lu nmea=%lu source=%s)\n",
                     (unsigned long)current_baud,
                     (unsigned)g_config.tx_pin,
                     (unsigned)g_config.rx_pin,
@@ -580,7 +624,7 @@ bool gps_task_init_autobaud_listen_only( uint8_t tx_pin, uint8_t rx_pin,
 
     if ( current_baud == 0 ) {
         open_uart( GpsTaskConfig{ .tx_pin = tx_pin, .rx_pin = rx_pin, .baud = fallback_baud } );
-        printf( "# [gps] listen-only autobaud failed; UART0 @ %lu baud on GPIO%u/%u\n",
+        log_print( "# [gps] listen-only autobaud failed; UART0 @ %lu baud on GPIO%u/%u\n",
                 (unsigned long)g_config.baud,
                 (unsigned)g_config.tx_pin,
                 (unsigned)g_config.rx_pin );
@@ -594,6 +638,7 @@ bool gps_task_init_autobaud_listen_only( uint8_t tx_pin, uint8_t rx_pin,
 void gps_task_poll( void )
 {
     if ( g_ready ) {
+        gps_lock();
         // Drain all currently buffered UART bytes. The GM10 can emit a mixed
         // UBX+NMEA burst larger than one read chunk per navigation epoch.
         const uint32_t now = to_ms_since_boot( get_absolute_time() );
@@ -662,7 +707,7 @@ void gps_task_poll( void )
 
             const gps::Coordinate& c = g_driver->coordinate();
             if ( g_nav_pvt_debug || !g_driver->has_fix() ) {
-                printf( "# [gps] %s bytes=%lu +raw_ubx=%lu +raw_pvt=%lu +ubx=%lu +pvt=%lu +nmea=%lu +ovf=%lu totals raw_ubx=%lu raw_pvt=%lu ubx=%lu pvt=%lu nmea=%lu bad_nmea=%lu ovf=%lu fix=%.*s sats=%d hAcc=%.1fm\n",
+                log_print( "# [gps] %s bytes=%lu +raw_ubx=%lu +raw_pvt=%lu +ubx=%lu +pvt=%lu +nmea=%lu +ovf=%lu totals raw_ubx=%lu raw_pvt=%lu ubx=%lu pvt=%lu nmea=%lu bad_nmea=%lu ovf=%lu fix=%.*s sats=%d hAcc=%.1fm\n",
                         g_driver->has_fix() ? "debug" : "no fix yet:",
                         (unsigned long)diag_bytes,
                         (unsigned long)tap_ubx_delta,
@@ -690,7 +735,7 @@ void gps_task_poll( void )
             if ( g_configure_output && diag_bytes > 0 && accepted_delta == 0 ) {
                 ++stale_windows;
                 if ( stale_windows >= 2 ) {
-                    printf( "# [gps] bytes are arriving but no frames parsed; re-sending GPS output config\n" );
+                    log_print( "# [gps] bytes are arriving but no frames parsed; re-sending GPS output config\n" );
                     configure_nav_pvt();
                     stale_windows = 0;
                 }
@@ -701,6 +746,18 @@ void gps_task_poll( void )
             diag_bytes = 0;
             diag_sample_count = 0;
         }
+        gps_unlock();
+    }
+}
+
+// FreeRTOS GPS task: continuously drain the UART IRQ ring and parse. Runs on
+// core 1 at a priority above the radio task so it is serviced promptly; the
+// 2 ms tick keeps the 8 KB ring well ahead of the byte rate even at 230400 baud.
+static void gps_task( void* )
+{
+    for ( ;; ) {
+        gps_task_poll();
+        vTaskDelay( pdMS_TO_TICKS( 2 ) );
     }
 }
 
@@ -716,5 +773,22 @@ void gps_task_set_nav_pvt_debug( bool enabled )
 
 bool gps_task_has_fix( void )
 {
-    return g_ready && g_driver->has_fix();
+    if ( !g_ready ) {
+        return false;
+    }
+    gps_lock();
+    const bool fix = g_driver->has_fix();
+    gps_unlock();
+    return fix;
+}
+
+void gps_task_start( unsigned priority )
+{
+    if ( !g_gps_mutex ) {
+        g_gps_mutex = xSemaphoreCreateMutexStatic( &g_gps_mutex_buf );
+    }
+    TaskHandle_t h = rtos_task_create( gps_task, "gps", 2048, nullptr,
+                                       (UBaseType_t)priority,
+                                       g_gps_stack, &g_gps_tcb );
+    vTaskCoreAffinitySet( h, 1u << 1 );  // core 1 (alongside the radio task)
 }

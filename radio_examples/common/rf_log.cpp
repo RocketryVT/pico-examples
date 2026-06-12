@@ -1,17 +1,48 @@
 // rf_log.cpp — see rf_log.h.
 
 #include "rf_log.h"
+#include "rf_console.h"   // log_print() — queued output to the console task
 
 #include "lfs.h"
 #include "lfs_pico_flash.h"
 
 #include "hardware/flash.h"   // FLASH_PAGE_SIZE (per-file cache buffer size)
 
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
+
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 
 namespace {
+
+// The filesystem is shared between the radio task (rf_log_write/sync) and the
+// console task (list/export/format). Serialize every littlefs operation behind
+// one mutex. Taken only once the scheduler is running (init runs single-threaded
+// before that).
+SemaphoreHandle_t g_fs_mutex = nullptr;
+StaticSemaphore_t g_fs_mutex_buf;
+
+bool sched_running()
+{
+    return xTaskGetSchedulerState() == taskSCHEDULER_RUNNING;
+}
+
+void fs_lock()
+{
+    if ( g_fs_mutex && sched_running() ) {
+        xSemaphoreTake( g_fs_mutex, portMAX_DELAY );
+    }
+}
+
+void fs_unlock()
+{
+    if ( g_fs_mutex && sched_running() ) {
+        xSemaphoreGive( g_fs_mutex );
+    }
+}
 
 lfs_t             g_lfs;
 struct lfs_config g_cfg;
@@ -114,7 +145,7 @@ bool open_new_log()
                                       LFS_O_RDWR | LFS_O_CREAT | LFS_O_TRUNC,
                                       &g_file_cfg );
     if ( err ) {
-        printf( "# [log] open '%s' failed (lfs %d)\n", g_name, err );
+        log_print( "# [log] open '%s' failed (lfs %d)\n", g_name, err );
         return false;
     }
     return true;
@@ -176,6 +207,12 @@ void dump_active()
 
 bool rf_log_init( const char* prefix )
 {
+    // Create the FS mutex up front (before the scheduler starts; never taken
+    // until it does).
+    if ( !g_fs_mutex ) {
+        g_fs_mutex = xSemaphoreCreateMutexStatic( &g_fs_mutex_buf );
+    }
+
     // Remember the prefix so rf_log_format() can reopen a fresh file later.
     strncpy( g_prefix, prefix, sizeof( g_prefix ) - 1 );
     g_prefix[sizeof( g_prefix ) - 1] = '\0';
@@ -184,19 +221,19 @@ bool rf_log_init( const char* prefix )
 
     const int err = lfs_pico_flash_mount( &g_lfs, &g_cfg );
     if ( err ) {
-        printf( "# [log] mount/format failed (lfs %d) — USB-only logging\n", err );
+        log_print( "# [log] mount/format failed (lfs %d) — USB-only logging\n", err );
         return false;
     }
 
     if ( !open_new_log() ) {
-        printf( "# [log] USB-only logging\n" );
+        log_print( "# [log] USB-only logging\n" );
         return false;
     }
 
     g_ready = true;
     g_full  = false;
-    printf( "# [log] writing to %s  (%lu bytes free)\n",
-            g_name, rf_log_bytes_free() );
+    log_print( "# [log] writing to %s  (%lu bytes free)\n",
+               g_name, rf_log_bytes_free() );
     return true;
 }
 
@@ -206,20 +243,25 @@ void rf_log_write( const char* line )
         return;
     }
 
-    const lfs_size_t len = (lfs_size_t)strlen( line );
-    const lfs_ssize_t n  = lfs_file_write( &g_lfs, &g_file, line, len );
+    fs_lock();
+    const lfs_size_t  len = (lfs_size_t)strlen( line );
+    const lfs_ssize_t n   = lfs_file_write( &g_lfs, &g_file, line, len );
+    fs_unlock();
+
     if ( n < 0 ) {
         // ENOSPC (or any write error): stop here so we don't spam the FS.
         g_full = true;
-        printf( "# [log] %s write failed (lfs %d) — file logging stopped\n",
-                g_name, (int)n );
+        log_print( "# [log] %s write failed (lfs %d) — file logging stopped\n",
+                   g_name, (int)n );
     }
 }
 
 void rf_log_sync( void )
 {
     if ( g_ready && !g_full ) {
+        fs_lock();
         lfs_file_sync( &g_lfs, &g_file );
+        fs_unlock();
     }
 }
 
@@ -243,8 +285,10 @@ void rf_log_list( void )
         return;
     }
 
+    fs_lock();
     const int n = collect_files();
     if ( n < 0 ) {
+        fs_unlock();
         printf( "# [log] list failed\n" );
         return;
     }
@@ -258,6 +302,7 @@ void rf_log_list( void )
     if ( n == 0 ) {
         printf( "#   (none)\n" );
     }
+    fs_unlock();
     printf( "# use 'export <n>' to dump one\n" );
 }
 
@@ -268,12 +313,15 @@ bool rf_log_export( int idx )
         return false;
     }
 
+    fs_lock();
     const int n = collect_files();
     if ( n <= 0 ) {
+        fs_unlock();
         printf( "# export: no logs (run 'list')\n" );
         return false;
     }
     if ( idx < 0 || idx >= n ) {
+        fs_unlock();
         printf( "# export: index %d out of range (0..%d)\n", idx, n - 1 );
         return false;
     }
@@ -282,9 +330,9 @@ bool rf_log_export( int idx )
     const bool  active = is_active( name );
 
     // Markers are '#'-prefixed so a serial capture's CSV parser skips them; the
-    // raw file bytes (its own header + rows) sit between. Nothing else is
-    // printed during the dump — the cooperative loop is blocked here — so no
-    // live rows interleave.
+    // raw file bytes (its own header + rows) sit between. The FS mutex is held
+    // for the whole dump, so no concurrent log write corrupts littlefs state and
+    // no live rows interleave (the radio task's flash writes block until done).
     printf( "# ---- begin export %s (%lu bytes)%s ----\n",
             name, (unsigned long)g_entries[idx].size, active ? " active" : "" );
 
@@ -295,11 +343,14 @@ bool rf_log_export( int idx )
     }
 
     printf( "\n# ---- end export %s ----\n", name );
+    fs_unlock();
     return true;
 }
 
 bool rf_log_format( void )
 {
+    fs_lock();
+
     // Close the active log and unmount before formatting (lfs_format needs an
     // unmounted FS).
     if ( g_ready ) {
@@ -313,11 +364,13 @@ bool rf_log_format( void )
 
     int err = lfs_format( &g_lfs, &g_cfg );
     if ( err ) {
+        fs_unlock();
         printf( "# [log] format failed (lfs %d)\n", err );
         return false;
     }
     err = lfs_mount( &g_lfs, &g_cfg );
     if ( err ) {
+        fs_unlock();
         printf( "# [log] remount after format failed (lfs %d)\n", err );
         return false;
     }
@@ -328,12 +381,15 @@ bool rf_log_format( void )
     }
 
     if ( !open_new_log() ) {
+        fs_unlock();
         return false;
     }
 
     g_ready = true;
     g_full  = false;
+    const unsigned long freebytes = rf_log_bytes_free();
+    fs_unlock();
     printf( "# [log] formatted — now writing to %s  (%lu bytes free)\n",
-            g_name, rf_log_bytes_free() );
+            g_name, freebytes );
     return true;
 }
