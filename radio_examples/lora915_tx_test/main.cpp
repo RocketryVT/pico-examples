@@ -50,7 +50,7 @@ static constexpr const char* MOD  = "lora";
 // GPS wiring for this board.
 static constexpr uint8_t  GPS_TX_PIN = 0;       // Pico TX -> GPS RX
 static constexpr uint8_t  GPS_RX_PIN = 1;       // Pico RX <- GPS TX
-static constexpr uint32_t GPS_BAUD   = 230400;  // force high-rate GPS UART
+static constexpr uint32_t GPS_BAUD   = 230400;  // preferred listen-only GPS UART
 
 // HAL + radio. Declared static/global because RadioLib keeps internal pointers
 // into the HAL and Module objects.
@@ -98,10 +98,14 @@ int main()
         rf_csv_set_sink( rf_log_write );
     }
 
-    // Bring up the UART0 GPS and auto-configure UBX NAV-PVT (stamps utc/gps_*).
-    gps_task_init_autobaud( GPS_TX_PIN, GPS_RX_PIN, GPS_BAUD );
+    // Bring up UART0 GPS in listen-only mode. The GM10/M10050 stream verified
+    // in u-center already emits valid NMEA fixes; do not send UBX config here.
+    gps_task_init_autobaud_listen_only( GPS_TX_PIN, GPS_RX_PIN, GPS_BAUD );
+    gps_task_set_nav_pvt_debug( true );
 
     printf( "# console: type 'list' or 'export <n>' (or 'help') over USB serial\n" );
+    printf( "# [tx] live CSV rows suppressed; use 'export <n>' for CSV logs\n" );
+    rf_csv_set_stdout_enabled( false );
     rf_csv_header();
     printf( "# [tx] RF payload RFT2 binary, %u bytes\n", (unsigned)sizeof( RfPacketV2 ) );
 

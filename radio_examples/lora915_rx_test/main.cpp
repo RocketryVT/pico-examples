@@ -17,6 +17,7 @@
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/spi.h"
+#include "hardware/uart.h"
 
 #include "PicoHal.h"        // Pico SDK implementation of RadioLibHal (lora/hal/)
 #include <RadioLib.h>
@@ -59,6 +60,11 @@ static constexpr uint8_t  RADIO_GPS_TX_PIN = 13;      // Pico TX -> GPS RX
 static constexpr uint8_t  RADIO_GPS_RX_PIN = 12;      // Pico RX <- GPS TX
 static constexpr uint32_t RADIO_GPS_BAUD   = 230400;  // u-center2 verified data rate
 
+// Temporary u-center bridge mode. This bypasses the radio test, does not send
+// any GPS configuration commands, and just relays USB CDC <-> GPS UART0.
+static constexpr bool     UCENTER_UART_RELAY = false;
+static constexpr uint32_t UCENTER_UART_BAUD  = 230400; // current module setting
+
 // HAL + radio. Declared static/global because RadioLib keeps internal pointers
 // into the HAL and Module objects.
 static PicoHal hal( spi0, static_cast<uint8_t>( PIN_SCK ),
@@ -67,8 +73,43 @@ static PicoHal hal( spi0, static_cast<uint8_t>( PIN_SCK ),
 static Module  module_( &hal, PIN_NSS, PIN_DIO0, PIN_RST, RADIOLIB_NC );
 static SX1276  radio( &module_ );
 
+void run_ucenter_uart_relay()
+{
+    stdio_init_all();
+
+    gpio_init( PIN_EN );
+    gpio_set_dir( PIN_EN, GPIO_OUT );
+    gpio_put( PIN_EN, 1 );
+
+    uart_init( uart0, UCENTER_UART_BAUD );
+    uart_set_hw_flow( uart0, false, false );
+    uart_set_format( uart0, 8, 1, UART_PARITY_NONE );
+    uart_set_fifo_enabled( uart0, true );
+    gpio_set_function( RADIO_GPS_TX_PIN, UART_FUNCSEL_NUM( uart0, RADIO_GPS_TX_PIN ) );
+    gpio_set_function( RADIO_GPS_RX_PIN, UART_FUNCSEL_NUM( uart0, RADIO_GPS_RX_PIN ) );
+
+    for ( ;; ) {
+        while ( uart_is_readable( uart0 ) ) {
+            putchar_raw( uart_getc( uart0 ) );
+        }
+
+        int c;
+        while ( ( c = getchar_timeout_us( 0 ) ) != PICO_ERROR_TIMEOUT ) {
+            if ( uart_is_writable( uart0 ) ) {
+                uart_putc_raw( uart0, static_cast<char>( c ) );
+            }
+        }
+
+        tight_loop_contents();
+    }
+}
+
 int main()
 {
+    if constexpr ( UCENTER_UART_RELAY ) {
+        run_ucenter_uart_relay();
+    }
+
     stdio_init_all();
 
     // Give a USB host a brief window to attach so we don't lose the early log
@@ -112,10 +153,14 @@ int main()
         rf_csv_set_sink( rf_log_write );
     }
 
-    // Bring up the UART0 GPS and auto-configure UBX NAV-PVT (stamps utc/gps_*).
-    gps_task_init_autobaud( RADIO_GPS_TX_PIN, RADIO_GPS_RX_PIN, RADIO_GPS_BAUD );
+    // Bring up UART0 GPS in listen-only mode. The GM10/M10050 stream verified
+    // in u-center already emits valid NMEA fixes; do not send UBX config here.
+    gps_task_init_autobaud_listen_only( RADIO_GPS_TX_PIN, RADIO_GPS_RX_PIN, RADIO_GPS_BAUD );
+    gps_task_set_nav_pvt_debug( true );
 
     printf( "# console: type 'list' or 'export <n>' (or 'help') over USB serial\n" );
+    printf( "# [rx] live CSV rows suppressed; use 'export <n>' for CSV logs\n" );
+    rf_csv_set_stdout_enabled( false );
     rf_csv_header();
 
     // Continuous receive; DIO0 goes high on RxDone in LoRa mode.

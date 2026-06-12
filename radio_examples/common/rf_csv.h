@@ -52,10 +52,16 @@
 typedef void ( *rf_csv_sink_t )( const char* line );
 
 static rf_csv_sink_t s_rf_csv_sink = nullptr;
+static bool s_rf_csv_stdout_enabled = true;
 
 static inline void rf_csv_set_sink( rf_csv_sink_t sink )
 {
     s_rf_csv_sink = sink;
+}
+
+static inline void rf_csv_set_stdout_enabled( bool enabled )
+{
+    s_rf_csv_stdout_enabled = enabled;
 }
 
 // Latest GPS fix to stamp onto subsequent rows. The main loop refreshes this
@@ -71,7 +77,9 @@ static inline void rf_csv_set_gps( const RfGps& fix )
 // Emit one fully-formed line (newline included) to stdout and the sink.
 static inline void rf_csv_emit( const char* line )
 {
-    fputs( line, stdout );
+    if ( s_rf_csv_stdout_enabled ) {
+        fputs( line, stdout );
+    }
     if ( s_rf_csv_sink ) {
         s_rf_csv_sink( line );
     }
