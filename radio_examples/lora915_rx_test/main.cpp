@@ -22,6 +22,7 @@
 #include <RadioLib.h>
 
 #include "rf_csv.h"         // common CSV output schema (../common/)
+#include "rf_payload.h"     // binary TX telemetry payload (../common/)
 #include "rf_log.h"         // mirror the CSV stream into on-chip flash (../common/)
 #include "gps_task.h"       // UART0 u-blox GPS — UTC + position stamping (../common/)
 #include "rf_console.h"     // USB "list" / "export" command console (../common/)
@@ -112,7 +113,7 @@ int main()
     }
 
     // Bring up the UART0 GPS and auto-configure UBX NAV-PVT (stamps utc/gps_*).
-    gps_task_init( RADIO_GPS_TX_PIN, RADIO_GPS_RX_PIN, RADIO_GPS_BAUD );
+    gps_task_init_autobaud( RADIO_GPS_TX_PIN, RADIO_GPS_RX_PIN, RADIO_GPS_BAUD );
 
     printf( "# console: type 'list' or 'export <n>' (or 'help') over USB serial\n" );
     rf_csv_header();
@@ -132,6 +133,7 @@ int main()
     uint32_t good_count = 0;       // good packets received
     uint32_t lost_count = 0;       // missing seq numbers (gaps)
     uint32_t crc_count  = 0;       // CRC failures
+    bool     warned_legacy_payload = false;
 
     for ( ;; ) {
         const uint32_t now = to_ms_since_boot( get_absolute_time() );
@@ -153,15 +155,28 @@ int main()
             const float ferr = radio.getFrequencyError();
 
             if ( err == RADIOLIB_ERR_NONE ) {
-                buf[len] = '\0';
+                RfTxTelemetry tx_meta;
 
-                // Recover the "#N" sequence number for loss tracking.
+                // Recover the packet sequence number for loss tracking. Prefer
+                // the current binary telemetry payload, but keep the old "#N"
+                // text fallback so historical/simple TX firmware still works.
                 bool          seq_ok = false;
                 unsigned long seq    = 0;
-                if ( const char* h = strchr( reinterpret_cast<char*>( buf ), '#' ) ) {
-                    char* end = nullptr;
-                    seq = strtoul( h + 1, &end, 10 );
-                    seq_ok = ( end != h + 1 );   // at least one digit parsed
+                if ( rf_payload_parse( buf, len, &tx_meta ) && tx_meta.has_seq ) {
+                    seq = tx_meta.seq;
+                    seq_ok = true;
+                } else {
+                    if ( !warned_legacy_payload ) {
+                        warned_legacy_payload = true;
+                        printf( "# [rx] non-RFT2 payload len=%lu; flash updated lora915_tx_test.uf2 for TX GPS fields\n",
+                                (unsigned long)len );
+                    }
+                    buf[( len < sizeof(buf) ) ? len : sizeof(buf) - 1] = '\0';
+                    if ( const char* h = strchr( reinterpret_cast<char*>( buf ), '#' ) ) {
+                        char* end = nullptr;
+                        seq = strtoul( h + 1, &end, 10 );
+                        seq_ok = ( end != h + 1 );   // at least one digit parsed
+                    }
                 }
 
                 if ( seq_ok ) {
@@ -184,11 +199,11 @@ int main()
 
                 const uint32_t expected = good_count + lost_count;
                 const float per = expected ? ( 100.0f * lost_count / expected ) : 0.0f;
-                rf_csv_row( now, ROLE, FREQ_MHZ, MOD, "packet",
-                            seq_ok ? (long)seq : -1, (long)len,
-                            rssi, snr, ferr,
-                            (long)good_count, (long)lost_count, (long)crc_count,
-                            per, -1 );
+                rf_csv_row_tx( now, ROLE, FREQ_MHZ, MOD, "packet",
+                               seq_ok ? (long)seq : -1, (long)len,
+                               rssi, snr, ferr,
+                               (long)good_count, (long)lost_count, (long)crc_count,
+                               per, -1, tx_meta.valid ? &tx_meta : nullptr );
             } else if ( err == RADIOLIB_ERR_CRC_MISMATCH ) {
                 // Energy received but corrupt — still proof the front end hears
                 // something. Very useful with a marginal antenna.

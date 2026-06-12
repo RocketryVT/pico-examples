@@ -7,7 +7,7 @@
 // One CSV row per event. Status / boot lines are printed separately as "# ..."
 // comments so the parser can skip them.
 //
-// Columns (19):
+// Columns (24):
 //   timestamp_ms  - Pico boot time in ms (to_ms_since_boot)
 //   role          - "rx" or "tx"
 //   freq_mhz      - carrier frequency (e.g. 915.0, 433.0)
@@ -28,6 +28,11 @@
 //   gps_alt_m     - MSL altitude from the UART0 GPS, m (blank until first fix)
 //   utc           - UTC timestamp "YYYY-MM-DDTHH:MM:SSZ" from the GPS (blank
 //                   until the time is resolved)
+//   tx_ms         - transmitter boot timestamp embedded in the RF payload
+//   tx_gps_lat    - transmitter latitude embedded in the RF payload
+//   tx_gps_lon    - transmitter longitude embedded in the RF payload
+//   tx_gps_alt_m  - transmitter altitude embedded in the RF payload
+//   tx_utc        - transmitter GPS UTC embedded in the RF payload
 //
 // The gps_* / utc columns are stamped from the latest fix supplied via
 // rf_csv_set_gps() (see rf_gps.h / gps_task.h). They stay blank on tools/boots
@@ -35,6 +40,7 @@
 #pragma once
 
 #include "rf_gps.h"
+#include "rf_payload.h"
 
 #include <cstdio>
 #include <cmath>
@@ -75,7 +81,8 @@ static inline void rf_csv_header( void )
 {
     rf_csv_emit( "timestamp_ms,role,freq_mhz,modulation,event,seq,len_bytes,"
                  "rssi_dbm,snr_db,ferr_hz,good,lost,crc,per_pct,air_ms,"
-                 "gps_lat,gps_lon,gps_alt_m,utc\n" );
+                 "gps_lat,gps_lon,gps_alt_m,utc,"
+                 "tx_ms,tx_gps_lat,tx_gps_lon,tx_gps_alt_m,tx_utc\n" );
 }
 
 // Emit one CSV row. Blank a field by passing a negative integer (seq/len/good/
@@ -88,6 +95,16 @@ static inline void rf_csv_row( unsigned long ts_ms,
                                float rssi, float snr, float ferr,
                                long good, long lost, long crc, float per,
                                long air )
+;
+
+static inline void rf_csv_row_tx( unsigned long ts_ms,
+                                  const char* role, float freq_mhz, const char* mod,
+                                  const char* event,
+                                  long seq, long len,
+                                  float rssi, float snr, float ferr,
+                                  long good, long lost, long crc, float per,
+                                  long air,
+                                  const RfTxTelemetry* tx )
 {
     char b_seq[12], b_len[12], b_rssi[16], b_snr[16], b_ferr[16];
     char b_good[12], b_lost[12], b_crc[12], b_per[12], b_air[12];
@@ -115,13 +132,45 @@ static inline void rf_csv_row( unsigned long ts_ms,
     }
     const char* utc = s_rf_gps.has_time ? s_rf_gps.utc : "";
 
-    // 15 value columns + gps_lat,gps_lon,gps_alt_m + utc.
-    char line[288];
+    char b_tx_ms[12], b_tx_lat[20], b_tx_lon[20], b_tx_alt[16];
+    const char* tx_utc = "";
+    if ( tx && tx->valid ) {
+        if ( tx->has_ms ) snprintf( b_tx_ms, sizeof b_tx_ms, "%lu", (unsigned long)tx->tx_ms );
+        else b_tx_ms[0] = '\0';
+
+        if ( tx->has_pos ) {
+            snprintf( b_tx_lat, sizeof b_tx_lat, "%.7f", tx->lat );
+            snprintf( b_tx_lon, sizeof b_tx_lon, "%.7f", tx->lon );
+            snprintf( b_tx_alt, sizeof b_tx_alt, "%.1f", (double)tx->alt_m );
+        } else {
+            b_tx_lat[0] = b_tx_lon[0] = b_tx_alt[0] = '\0';
+        }
+
+        tx_utc = tx->has_time ? tx->utc : "";
+    } else {
+        b_tx_ms[0] = b_tx_lat[0] = b_tx_lon[0] = b_tx_alt[0] = '\0';
+    }
+
+    // 15 value columns + local GPS/time + transmitter GPS/time.
+    char line[384];
     snprintf( line, sizeof line,
-              "%lu,%s,%.1f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+              "%lu,%s,%.1f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
               ts_ms, role, (double)freq_mhz, mod, event,
               b_seq, b_len, b_rssi, b_snr, b_ferr,
               b_good, b_lost, b_crc, b_per, b_air,
-              b_lat, b_lon, b_alt, utc );
+              b_lat, b_lon, b_alt, utc,
+              b_tx_ms, b_tx_lat, b_tx_lon, b_tx_alt, tx_utc );
     rf_csv_emit( line );
+}
+
+static inline void rf_csv_row( unsigned long ts_ms,
+                               const char* role, float freq_mhz, const char* mod,
+                               const char* event,
+                               long seq, long len,
+                               float rssi, float snr, float ferr,
+                               long good, long lost, long crc, float per,
+                               long air )
+{
+    rf_csv_row_tx( ts_ms, role, freq_mhz, mod, event, seq, len,
+                   rssi, snr, ferr, good, lost, crc, per, air, nullptr );
 }

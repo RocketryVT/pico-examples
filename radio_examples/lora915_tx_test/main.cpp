@@ -15,6 +15,7 @@
 #include <RadioLib.h>
 
 #include "rf_csv.h"         // common CSV output schema (../common/)
+#include "rf_payload.h"     // binary TX telemetry payload (../common/)
 #include "rf_log.h"         // mirror the CSV stream into on-chip flash (../common/)
 #include "gps_task.h"       // UART0 u-blox GPS — UTC + position stamping (../common/)
 #include "rf_console.h"     // USB "list" / "export" command console (../common/)
@@ -49,7 +50,7 @@ static constexpr const char* MOD  = "lora";
 // GPS wiring for this board.
 static constexpr uint8_t  GPS_TX_PIN = 0;       // Pico TX -> GPS RX
 static constexpr uint8_t  GPS_RX_PIN = 1;       // Pico RX <- GPS TX
-static constexpr uint32_t GPS_BAUD   = 115200;  // Flywoo GM10 Nano V3.1 default
+static constexpr uint32_t GPS_BAUD   = 230400;  // force high-rate GPS UART
 
 // HAL + radio. Declared static/global because RadioLib keeps internal pointers
 // into the HAL and Module objects.
@@ -98,27 +99,28 @@ int main()
     }
 
     // Bring up the UART0 GPS and auto-configure UBX NAV-PVT (stamps utc/gps_*).
-    gps_task_init( GPS_TX_PIN, GPS_RX_PIN, GPS_BAUD );
+    gps_task_init_autobaud( GPS_TX_PIN, GPS_RX_PIN, GPS_BAUD );
 
     printf( "# console: type 'list' or 'export <n>' (or 'help') over USB serial\n" );
     rf_csv_header();
+    printf( "# [tx] RF payload RFT2 binary, %u bytes\n", (unsigned)sizeof( RfPacketV2 ) );
 
-    char     msg[64];
+    uint8_t  msg[sizeof( RfPacketV2 )];
     uint32_t count = 0;
 
     for ( ;; ) {
-        snprintf( msg, sizeof(msg), "lora915_tx_test #%lu", (unsigned long)count );
-        const size_t len = strlen( msg );
+        // Stamp the freshest GPS fix into the RF packet itself.
+        gps_task_poll();
+        const RfGps tx_gps = gps_task_fix();
+        rf_csv_set_gps( tx_gps );
+
+        const uint32_t tx_ms = to_ms_since_boot( get_absolute_time() );
+        const size_t len = rf_payload_build( msg, sizeof msg, count, tx_ms, tx_gps );
 
         const uint32_t t0  = to_ms_since_boot( get_absolute_time() );
-        state = radio.transmit( reinterpret_cast<uint8_t*>( msg ),
-                                static_cast<size_t>( len ) );
+        state = radio.transmit( msg, len );
         const uint32_t t1  = to_ms_since_boot( get_absolute_time() );
         const uint32_t air = t1 - t0;
-
-        // Stamp the freshest GPS fix onto this beacon's row.
-        gps_task_poll();
-        rf_csv_set_gps( gps_task_fix() );
 
         rf_csv_row( t1, ROLE, FREQ_MHZ, MOD,
                     ( state == RADIOLIB_ERR_NONE ) ? "tx_ok" : "tx_fail",
