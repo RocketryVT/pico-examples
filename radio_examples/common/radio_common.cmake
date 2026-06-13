@@ -98,6 +98,7 @@ set(RADIO_COMMON_LIBS
     hardware_sync
     hardware_uart
     hardware_i2c   # gps_driver.hpp includes hardware/i2c.h (I2cTransport)
+    hardware_dma   # gps_driver.hpp includes hardware/dma.h (DMA ring RX)
     FreeRTOS-Kernel
     FreeRTOS-Kernel-Heap4
 )

@@ -25,18 +25,20 @@
 #include "FreeRTOS.h"
 #include "task.h"
 
+#include "boards/board_pins.hpp"   // Pins:: for the active PICO_BOARD (board-neutral)
+
 #include <cstdio>
 #include <cstring>
 #include <cmath>
 
-// -- LoRa1 / 433 MHz RFM69HCW wiring (SPI1) — from shared.hpp Pins --------------
-static constexpr uint PIN_MISO = 8;   // GPIO  8, phys 11
-static constexpr uint PIN_NSS  = 9;   // GPIO  9, phys 12 — CS
-static constexpr uint PIN_SCK  = 10;  // GPIO 10, phys 14
-static constexpr uint PIN_MOSI = 11;  // GPIO 11, phys 15
-static constexpr uint PIN_RST  = 26;  // GPIO 26, phys 31 — reset
-static constexpr uint PIN_DIO0 = 27;  // GPIO 27, phys 32 — G0 / IRQ (TxDone)
-static constexpr uint PIN_EN   = 28;  // GPIO 28, phys 34 — power enable (active high)
+// -- LoRa1 / 433 MHz RFM69HCW wiring (SPI1) — from gs_pcb_v1 board pin map ------
+static constexpr uint PIN_MISO = Pins::LORA1_MISO;
+static constexpr uint PIN_NSS  = Pins::LORA1_NSS;   // CS
+static constexpr uint PIN_SCK  = Pins::LORA1_SCK;
+static constexpr uint PIN_MOSI = Pins::LORA1_MOSI;
+static constexpr uint PIN_RST  = Pins::LORA1_RST;   // reset
+static constexpr uint PIN_DIO0 = Pins::LORA1_DIO0;  // G0 / IRQ (TxDone)
+static constexpr uint PIN_EN   = Pins::LORA1_EN;    // power enable (active high)
 
 // -- LoRa1 / RF69 air config — from LoRa1Cfg in shared.hpp ----------------------
 static constexpr float    FREQ_MHZ  = 433.0f;
@@ -51,9 +53,9 @@ static constexpr bool     HIGH_POWER = true;   // RFM69HCW PA-boost variant
 static constexpr const char* ROLE = "tx";
 static constexpr const char* MOD  = "gfsk";
 
-// GPS wiring for this board.
-static constexpr uint8_t  GPS_TX_PIN = 0;       // Pico TX -> GPS RX
-static constexpr uint8_t  GPS_RX_PIN = 1;       // Pico RX <- GPS TX
+// GPS wiring — from gs_pcb_v1 board pin map (UART0 TX=12, RX=13).
+static constexpr uint8_t  GPS_TX_PIN = Pins::GPS_TX;
+static constexpr uint8_t  GPS_RX_PIN = Pins::GPS_RX;
 static constexpr uint32_t GPS_BAUD   = 115200;  // Flywoo GM10 Nano V3.1 default
 
 // HAL + radio. Declared static/global because RadioLib keeps internal pointers

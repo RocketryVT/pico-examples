@@ -25,11 +25,14 @@ endif()
 cmake_minimum_required(VERSION 3.13)
 
 set(PICO_PLATFORM rp2350-arm-s)
-set(PICO_BOARD pico2_w)
+set(PICO_BOARD gs_pcb_v1)
 
 # Locate the avionics root (4 levels up: projects/pico_examples/radio_examples/<name> -> Avionics)
 get_filename_component(AVIONICS_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../../.." ABSOLUTE)
 include(${AVIONICS_ROOT}/cmake/deps.cmake)
+
+# Custom GSPCB board definition lives in boards/gs_pcb_v1.h (layers on pico2_w).
+set(PICO_BOARD_HEADER_DIRS ${AVIONICS_ROOT}/boards)
 
 # Pull in Pico SDK (must be before project())
 set(PICO_SDK_ROOT ${PICO_SDK_PATH})
@@ -68,6 +71,8 @@ add_executable(rfm69_433_rx_test main.cpp ${RADIO_COMMON_SOURCES})
 # PicoHal.h (Pico SDK implementation of RadioLibHal) lives in lora/hal/.
 # rf_csv.h (shared CSV output schema) lives in ../common/.
 target_include_directories(rfm69_433_rx_test PRIVATE
+    ${AVIONICS_ROOT}            # boards/board.hpp + boards/<board>_pins.hpp
+    ${CMAKE_CURRENT_LIST_DIR}   # this project's board_profile.hpp (APP_HAS_* + Board::)
     ${LORA_ROOT}/hal
     ${RADIO_COMMON_INCLUDE}
 )

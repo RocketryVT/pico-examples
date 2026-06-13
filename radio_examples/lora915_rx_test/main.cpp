@@ -32,19 +32,21 @@
 #include "FreeRTOS.h"
 #include "task.h"
 
+#include "boards/board_pins.hpp"   // Pins:: for the active PICO_BOARD (board-neutral)
+
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
 
-// -- LoRa0 / 915 MHz radio wiring (SPI0) — from shared.hpp Pins -----------------
-static constexpr uint PIN_EN   = 16;  // GPIO 16, phys 21 — power enable (active high)
-static constexpr uint PIN_DIO0 = 17;  // GPIO 17, phys 22 — G0 / IRQ (RxDone)
-static constexpr uint PIN_SCK  = 18;  // GPIO 18, phys 24
-static constexpr uint PIN_MOSI = 19;  // GPIO 19, phys 25
-static constexpr uint PIN_MISO = 20;  // GPIO 20, phys 26
-static constexpr uint PIN_NSS  = 21;  // GPIO 21, phys 27 — CS
-static constexpr uint PIN_RST  = 22;  // GPIO 22, phys 29 — reset
+// -- LoRa0 / 915 MHz radio wiring (SPI0) — from gs_pcb_v1 board pin map ---------
+static constexpr uint PIN_EN   = Pins::LORA0_EN;    // power enable (active high)
+static constexpr uint PIN_DIO0 = Pins::LORA0_DIO0;  // G0 / IRQ (RxDone)
+static constexpr uint PIN_SCK  = Pins::LORA0_SCK;
+static constexpr uint PIN_MOSI = Pins::LORA0_MOSI;
+static constexpr uint PIN_MISO = Pins::LORA0_MISO;
+static constexpr uint PIN_NSS  = Pins::LORA0_NSS;   // CS
+static constexpr uint PIN_RST  = Pins::LORA0_RST;   // reset
 
 // -- LoRa0 air config — from LoRa0Cfg in shared.hpp ----------------------------
 static constexpr float   FREQ_MHZ  = 915.0f;
@@ -59,9 +61,9 @@ static constexpr uint16_t PREAMBLE = 8;
 static constexpr const char* ROLE = "rx";
 static constexpr const char* MOD  = "lora";
 
-// GPS wiring for this 915 MHz RX board.
-static constexpr uint8_t  RADIO_GPS_TX_PIN = 13;      // Pico TX -> GPS RX
-static constexpr uint8_t  RADIO_GPS_RX_PIN = 12;      // Pico RX <- GPS TX
+// GPS wiring — from gs_pcb_v1 board pin map (UART0 TX=12, RX=13).
+static constexpr uint8_t  RADIO_GPS_TX_PIN = Pins::GPS_TX;
+static constexpr uint8_t  RADIO_GPS_RX_PIN = Pins::GPS_RX;
 static constexpr uint32_t RADIO_GPS_BAUD   = 230400;  // u-center2 verified data rate
 
 // Temporary u-center bridge mode. This bypasses the radio test, does not send

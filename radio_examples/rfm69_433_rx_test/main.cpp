@@ -28,36 +28,54 @@
 #include "FreeRTOS.h"
 #include "task.h"
 
+#include "boards/board.hpp"   // HAS_* flags + Pins:: + Board:: (board + project profile)
+
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
 
-// -- LoRa1 / 433 MHz RFM69HCW wiring (SPI1) — from shared.hpp Pins --------------
-static constexpr uint PIN_MISO = 8;   // GPIO  8, phys 11
-static constexpr uint PIN_NSS  = 9;   // GPIO  9, phys 12 — CS
-static constexpr uint PIN_SCK  = 10;  // GPIO 10, phys 14
-static constexpr uint PIN_MOSI = 11;  // GPIO 11, phys 15
-static constexpr uint PIN_RST  = 26;  // GPIO 26, phys 31 — reset
-static constexpr uint PIN_DIO0 = 27;  // GPIO 27, phys 32 — G0 / IRQ (PayloadReady)
-static constexpr uint PIN_EN   = 28;  // GPIO 28, phys 34 — power enable (active high)
+// This tool needs a 433 MHz RFM69 and a GPS plugged into the carrier. Assert on
+// the device matrix from board_profile.hpp (not just the coarse category gate),
+// so pointing it at a board/profile that lacks the actual chip fails loudly.
+static_assert(HAS_RADIO, "rfm69_433_rx_test requires a radio (set APP_HAS_RADIO in board_profile.hpp)");
+static_assert(HAS_GPS,   "rfm69_433_rx_test requires a GPS (set APP_HAS_GPS in board_profile.hpp)");
+static_assert(Board::has_model(Board::Radios, Board::RadioModel::RFM69HCW),
+              "rfm69_433_rx_test requires an RFM69HCW in Board::Radios");
 
-// -- LoRa1 / RF69 air config — from LoRa1Cfg in shared.hpp ----------------------
-static constexpr float    FREQ_MHZ  = 433.0f;
-static constexpr float    BR_KBPS   = 4.8f;    // bit rate
-static constexpr float    FDEV_KHZ  = 5.0f;    // frequency deviation
-static constexpr float    RXBW_KHZ  = 125.0f;  // RX channel filter bandwidth
-static constexpr int8_t   RX_DBM    = 13;      // RX-only; PA power is irrelevant
-static constexpr uint16_t PREAMBLE  = 16;      // preamble length in bits
+// The RFM69 instance this tool drives (first 433-capable radio in the profile).
+static constexpr Board::RadioInstance RADIO = Board::Radios[0];
+
+// -- RFM69 wiring (its SPI bus connector) — from the active board's Pins:: map --
+// (Radios[0].cs_pin carries the CS; the rest of the SPI1 connector is Pins::LORA1_*.)
+static constexpr uint PIN_MISO = Pins::LORA1_MISO;
+static constexpr uint PIN_NSS  = RADIO.cs_pin;      // CS
+static constexpr uint PIN_SCK  = Pins::LORA1_SCK;
+static constexpr uint PIN_MOSI = Pins::LORA1_MOSI;
+static constexpr uint PIN_RST  = Pins::LORA1_RST;   // reset
+static constexpr uint PIN_DIO0 = Pins::LORA1_DIO0;  // G0 / IRQ (PayloadReady)
+static constexpr uint PIN_EN   = Pins::LORA1_EN;    // power enable (active high)
+
+// -- RFM69 config: operating freq from the instance; link params from the profile.
+static constexpr float    FREQ_MHZ  = RADIO.freq_mhz;
+static constexpr float    BR_KBPS   = Board::Rfm433::BR_KBPS;
+static constexpr float    FDEV_KHZ  = Board::Rfm433::FDEV_KHZ;
+static constexpr float    RXBW_KHZ  = Board::Rfm433::RXBW_KHZ;
+static constexpr int8_t   RX_DBM    = Board::Rfm433::RX_DBM;
+static constexpr uint16_t PREAMBLE  = Board::Rfm433::PREAMBLE;
+// Operating freq must be within the chip's range (spec_of from devices.hpp).
+static_assert(FREQ_MHZ >= Board::spec_of(RADIO.model).freq_min_mhz &&
+              FREQ_MHZ <= Board::spec_of(RADIO.model).freq_max_mhz,
+              "RFM69 operating frequency outside the device's supported band");
 
 // CSV identity for this tool.
 static constexpr const char* ROLE = "rx";
 static constexpr const char* MOD  = "gfsk";
 
-// GPS wiring for this board.
-static constexpr uint8_t  GPS_TX_PIN = 0;       // Pico TX -> GPS RX
-static constexpr uint8_t  GPS_RX_PIN = 1;       // Pico RX <- GPS TX
-static constexpr uint32_t GPS_BAUD   = 115200;  // Flywoo GM10 Nano V3.1 default
+// GPS wiring (UART0 connector) from Pins::; baud from the GPS instance.
+static constexpr uint8_t  GPS_TX_PIN = Pins::GPS_TX;
+static constexpr uint8_t  GPS_RX_PIN = Pins::GPS_RX;
+static constexpr uint32_t GPS_BAUD   = Board::Gpses[0].baud;
 
 // HAL + radio. Declared static/global because RadioLib keeps internal pointers
 // into the HAL and Module objects.

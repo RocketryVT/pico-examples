@@ -197,7 +197,7 @@ void configure_nav_pvt()
     g_driver->send_ubx( gps::Ubx::valset_uart1_outprot_nmea( true ) );
     g_driver->send_ubx( gps::Ubx::valset_nav_pvt_uart1( 1 ) );
     g_driver->send_ubx( gps::Ubx::valset_rate_meas( GPS_RATE_MS ) );
-    g_driver->send_ubx( gps::Ubx::valset_dyn_model( 2 ) );  // stationary bench test
+    g_driver->send_ubx( gps::Ubx::valset_dyn_model( gps::Ubx::DynModel::Stationary ) );  // bench test
     sleep_ms( 200 );  // let the module apply the config before we poll.
 }
 
