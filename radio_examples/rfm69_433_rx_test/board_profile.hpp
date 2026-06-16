@@ -22,7 +22,7 @@ namespace Board {
 // Devices plugged into the carrier's connectors. devices.hpp + Pins:: come from
 // board.hpp (included before this file), so we can name models and wire to Pins.
 inline constexpr RadioInstance Radios[] = {
-    { RadioModel::RFM69HCW, Bus::SPI1, Pins::LORA1_NSS, 433.0f, "433-gfsk" },
+    { RadioModel::RFM69HCW, Bus::SPI1, Pins::LORA1_NSS, 424.500f, "433-gfsk" },
 };
 inline constexpr int RadioCount = static_cast<int>(std::size(Radios));
 

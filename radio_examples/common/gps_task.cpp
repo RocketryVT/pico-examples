@@ -51,7 +51,7 @@ StaticTask_t g_gps_tcb;
 StackType_t  g_gps_stack[2048];
 
 // -- UART0 link config ---------------------------------------------------------
-constexpr uint16_t GPS_RATE_MS = 1000; // 1 Hz navigation solution
+constexpr uint16_t GPS_DEFAULT_RATE_MS = 1000; // 1 Hz navigation solution
 constexpr uint32_t GPS_DIAG_MS = 5000; // low-rate "why are fields blank?" hint
 constexpr uint32_t GPS_STALE_MS = 3000; // blank cached GPS fields after this
 
@@ -59,6 +59,7 @@ struct GpsTaskConfig {
     uint8_t  tx_pin = 0;      // Pico UART0 TX -> GPS RX
     uint8_t  rx_pin = 1;      // Pico UART0 RX <- GPS TX
     uint32_t baud   = 115200;
+    uint16_t rate_ms = GPS_DEFAULT_RATE_MS;
 };
 
 // The driver owns the transport by reference, so both must outlive every poll.
@@ -196,7 +197,7 @@ void configure_nav_pvt()
     // GGA/RMC fixes while their UBX-compatible NAV-PVT fix flags lag or differ.
     g_driver->send_ubx( gps::Ubx::valset_uart1_outprot_nmea( true ) );
     g_driver->send_ubx( gps::Ubx::valset_nav_pvt_uart1( 1 ) );
-    g_driver->send_ubx( gps::Ubx::valset_rate_meas( GPS_RATE_MS ) );
+    g_driver->send_ubx( gps::Ubx::valset_rate_meas( g_config.rate_ms ) );
     g_driver->send_ubx( gps::Ubx::valset_dyn_model( gps::Ubx::DynModel::Stationary ) );  // bench test
     sleep_ms( 200 );  // let the module apply the config before we poll.
 }
@@ -528,10 +529,14 @@ RfGps snapshot()
 
 }  // namespace
 
-bool gps_task_init( uint8_t tx_pin, uint8_t rx_pin, uint32_t baud )
+bool gps_task_init_nav_hz( uint8_t tx_pin, uint8_t rx_pin, uint32_t baud,
+                           uint16_t nav_hz )
 {
     g_configure_output = true;
-    open_uart( GpsTaskConfig{ .tx_pin = tx_pin, .rx_pin = rx_pin, .baud = baud } );
+    const uint16_t rate_ms = nav_hz == 0 ? GPS_DEFAULT_RATE_MS
+                                         : static_cast<uint16_t>( 1000u / nav_hz );
+    open_uart( GpsTaskConfig{ .tx_pin = tx_pin, .rx_pin = rx_pin, .baud = baud,
+                              .rate_ms = rate_ms } );
     configure_nav_pvt();
 
     g_ready = true;
@@ -540,8 +545,13 @@ bool gps_task_init( uint8_t tx_pin, uint8_t rx_pin, uint32_t baud )
             (unsigned long)g_config.baud,
             (unsigned)g_config.tx_pin,
             (unsigned)g_config.rx_pin,
-            (unsigned)GPS_RATE_MS );
+            (unsigned)g_config.rate_ms );
     return true;
+}
+
+bool gps_task_init( uint8_t tx_pin, uint8_t rx_pin, uint32_t baud )
+{
+    return gps_task_init_nav_hz( tx_pin, rx_pin, baud, 1 );
 }
 
 bool gps_task_init_autobaud( uint8_t tx_pin, uint8_t rx_pin, uint32_t target_baud )
@@ -588,7 +598,7 @@ bool gps_task_init_autobaud( uint8_t tx_pin, uint8_t rx_pin, uint32_t target_bau
             (unsigned long)g_config.baud,
             (unsigned)g_config.tx_pin,
             (unsigned)g_config.rx_pin,
-            (unsigned)GPS_RATE_MS );
+            (unsigned)g_config.rate_ms );
     return true;
 }
 

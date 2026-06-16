@@ -40,6 +40,11 @@ extern "C" {
 // module just means no fixes arrive).
 bool gps_task_init( uint8_t tx_pin, uint8_t rx_pin, uint32_t baud );
 
+// Same as gps_task_init(), but configures the receiver's navigation solution
+// rate from the board/profile GPS instance.
+bool gps_task_init_nav_hz( uint8_t tx_pin, uint8_t rx_pin, uint32_t baud,
+                           uint16_t nav_hz );
+
 // Detect the module's current UART baud from valid NMEA/UBX traffic, switch it
 // to target_baud with UBX CFG-UART1-BAUDRATE when needed, then configure NAV-PVT.
 // Falls back to opening target_baud directly if no valid stream is detected.

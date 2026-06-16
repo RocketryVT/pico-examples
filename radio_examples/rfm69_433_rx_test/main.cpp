@@ -40,11 +40,24 @@
 // so pointing it at a board/profile that lacks the actual chip fails loudly.
 static_assert(HAS_RADIO, "rfm69_433_rx_test requires a radio (set APP_HAS_RADIO in board_profile.hpp)");
 static_assert(HAS_GPS,   "rfm69_433_rx_test requires a GPS (set APP_HAS_GPS in board_profile.hpp)");
+static_assert(Board::RadioCount > 0, "rfm69_433_rx_test requires at least one Board::Radios entry");
+static_assert(Board::GpsCount > 0, "rfm69_433_rx_test requires at least one Board::Gpses entry");
 static_assert(Board::has_model(Board::Radios, Board::RadioModel::RFM69HCW),
               "rfm69_433_rx_test requires an RFM69HCW in Board::Radios");
 
 // The RFM69 instance this tool drives (first 433-capable radio in the profile).
 static constexpr Board::RadioInstance RADIO = Board::Radios[0];
+static constexpr Board::GpsInstance GPS = Board::Gpses[0];
+
+static_assert(RADIO.model == Board::RadioModel::RFM69HCW,
+              "rfm69_433_rx_test requires Board::Radios[0] to be an RFM69HCW");
+static_assert(RADIO.bus == Board::Bus::SPI1,
+              "rfm69_433_rx_test currently supports the RFM69 on SPI1 only");
+static_assert(GPS.bus == Board::Bus::UART0,
+              "rfm69_433_rx_test currently supports GPS on UART0 only");
+static_assert(GPS.nav_hz > 0, "GPS nav_hz must be non-zero");
+static_assert(GPS.nav_hz <= Board::spec_of(GPS.model).max_nav_hz,
+              "GPS nav_hz exceeds the selected receiver's device spec");
 
 // -- RFM69 wiring (its SPI bus connector) — from the active board's Pins:: map --
 // (Radios[0].cs_pin carries the CS; the rest of the SPI1 connector is Pins::LORA1_*.)
@@ -63,6 +76,7 @@ static constexpr float    FDEV_KHZ  = Board::Rfm433::FDEV_KHZ;
 static constexpr float    RXBW_KHZ  = Board::Rfm433::RXBW_KHZ;
 static constexpr int8_t   RX_DBM    = Board::Rfm433::RX_DBM;
 static constexpr uint16_t PREAMBLE  = Board::Rfm433::PREAMBLE;
+static constexpr uint8_t  PACKET_LEN = 32;
 // Operating freq must be within the chip's range (spec_of from devices.hpp).
 static_assert(FREQ_MHZ >= Board::spec_of(RADIO.model).freq_min_mhz &&
               FREQ_MHZ <= Board::spec_of(RADIO.model).freq_max_mhz,
@@ -75,7 +89,7 @@ static constexpr const char* MOD  = "gfsk";
 // GPS wiring (UART0 connector) from Pins::; baud from the GPS instance.
 static constexpr uint8_t  GPS_TX_PIN = Pins::GPS_TX;
 static constexpr uint8_t  GPS_RX_PIN = Pins::GPS_RX;
-static constexpr uint32_t GPS_BAUD   = Board::Gpses[0].baud;
+static constexpr uint32_t GPS_BAUD   = GPS.baud;
 
 // HAL + radio. Declared static/global because RadioLib keeps internal pointers
 // into the HAL and Module objects.
@@ -92,31 +106,35 @@ static constexpr UBaseType_t RADIO_TASK_PRIORITY = 2;
 static StaticTask_t s_radio_tcb;
 static StackType_t  s_radio_stack[4096];
 
-// Diagnostic init. begin() returned -25 (UNSUPPORTED) and nothing in RadioLib's
-// RF69 begin sequence should return that — so probe explicitly: read the chip
-// version register, then run each config setter WITHOUT bailing, printing every
-// status code. This pinpoints the offending call and the chip revision in one
-// flash. (RadioLib RF69 expects version 0x24 = SX1231 rev 2D.)
+static int log_init_step( const char* label, int state )
+{
+    log_print( "# [rx] %s = %d\n", label, state );
+    return state;
+}
+
 static int radio_init()
 {
-    int err = radio.begin();   // also initializes the SPI/HAL
-    log_print( "# [rx] begin() = %d\n", err );
+    ConfigFSK_t cfg;
+    cfg.frequency          = FREQ_MHZ;
+    cfg.bitRate            = BR_KBPS;
+    cfg.frequencyDeviation = FDEV_KHZ;
+    cfg.receiverBandwidth  = RXBW_KHZ;
+    cfg.power              = RX_DBM;
+    cfg.preambleLength     = PREAMBLE;
 
-    const int16_t ver = radio.getChipVersion();
-    log_print( "# [rx] chip version reg = 0x%02X (raw %d; RadioLib wants 0x24)\n",
-            (unsigned)( ver & 0xFF ), ver );
+    int err = log_init_step( "begin", radio.begin( cfg ) );
+    if ( err != RADIOLIB_ERR_NONE ) return err;
 
-    int16_t e;
-    e = radio.standby();                       log_print( "# [rx] standby = %d\n", e );
-    e = radio.setFrequency( FREQ_MHZ );        log_print( "# [rx] setFrequency = %d\n", e );
-    e = radio.setBitRate( BR_KBPS );           log_print( "# [rx] setBitRate = %d\n", e );
-    e = radio.setRxBandwidth( RXBW_KHZ );      log_print( "# [rx] setRxBandwidth = %d\n", e );
-    e = radio.setFrequencyDeviation( FDEV_KHZ );log_print( "# [rx] setFrequencyDeviation = %d\n", e );
-    e = radio.setOutputPower( RX_DBM );        log_print( "# [rx] setOutputPower = %d\n", e );
-    e = radio.setPreambleLength( PREAMBLE );   log_print( "# [rx] setPreambleLength = %d\n", e );
-    e = radio.setDataShaping( RADIOLIB_SHAPING_0_5 ); log_print( "# [rx] setDataShaping = %d\n", e );
+    // Match the transmitter's fixed-length test packet. This avoids the RF69
+    // variable-length FIFO byte so the sanity test exercises only RF payload IO.
+    err = log_init_step( "fixedPacketLengthMode", radio.fixedPacketLengthMode( PACKET_LEN ) );
+    if ( err != RADIOLIB_ERR_NONE ) return err;
 
-    return err;
+    // GFSK: Gaussian shaping, BT = 0.5. Must match the transmitter.
+    err = log_init_step( "setDataShaping", radio.setDataShaping( RADIOLIB_SHAPING_0_5 ) );
+    if ( err != RADIOLIB_ERR_NONE ) return err;
+
+    return RADIOLIB_ERR_NONE;
 }
 
 // -- Radio task: RFM69 init + continuous-receive loop (core 1) ----------------
@@ -145,7 +163,7 @@ static void radio_task( void* )
     // Continuous receive; DIO0 maps to PayloadReady in RX packet mode.
     radio.startReceive();
 
-    uint8_t  buf[64];   // RF69 FIFO depth
+    uint8_t  buf[PACKET_LEN + 1];
     uint32_t last_floor_ms = 0;
 
     // -- Link statistics -------------------------------------------------------
@@ -162,9 +180,9 @@ static void radio_task( void* )
         rf_csv_set_gps( gps_task_fix() );
 
         // -- Packet arrived? ---------------------------------------------------
-        if ( gpio_get( PIN_DIO0 ) ) {
-            size_t len = static_cast<size_t>( radio.getPacketLength() );
-            if ( len > sizeof(buf) - 1 ) len = sizeof(buf) - 1;
+        const uint8_t irq2 = module_.SPIreadRegister( RADIOLIB_RF69_REG_IRQ_FLAGS_2 );
+        if ( irq2 & RADIOLIB_RF69_IRQ_PAYLOAD_READY ) {
+            size_t len = PACKET_LEN;
             const int err = radio.readData( buf, len );
 
             // RF69 reads the live RSSI register, so grab it right after the
@@ -263,8 +281,8 @@ int main()
         rf_csv_set_sink( rf_log_write );
     }
 
-    // Bring up the UART0 GPS and auto-configure UBX NAV-PVT (stamps utc/gps_*).
-    gps_task_init( GPS_TX_PIN, GPS_RX_PIN, GPS_BAUD );
+    // Bring up the profile GPS and auto-configure UBX NAV-PVT (stamps utc/gps_*).
+    gps_task_init_nav_hz( GPS_TX_PIN, GPS_RX_PIN, GPS_BAUD, GPS.nav_hz );
 
     rf_csv_set_stdout_enabled( false );
     log_print( "# console: 'list' / 'export <n>' / 'live on' (or 'help') over USB\n" );

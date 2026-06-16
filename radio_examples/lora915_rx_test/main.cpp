@@ -32,39 +32,60 @@
 #include "FreeRTOS.h"
 #include "task.h"
 
-#include "boards/board_pins.hpp"   // Pins:: for the active PICO_BOARD (board-neutral)
+#include "boards/board.hpp"   // HAS_* flags + Pins:: + Board:: device profile
 
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
 
-// -- LoRa0 / 915 MHz radio wiring (SPI0) — from gs_pcb_v1 board pin map ---------
+static_assert(HAS_RADIO, "lora915_rx_test requires a radio (set APP_HAS_RADIO in board_profile.hpp)");
+static_assert(HAS_GPS,   "lora915_rx_test requires a GPS (set APP_HAS_GPS in board_profile.hpp)");
+static_assert(Board::RadioCount > 0, "lora915_rx_test requires at least one Board::Radios entry");
+static_assert(Board::GpsCount > 0, "lora915_rx_test requires at least one Board::Gpses entry");
+
+static constexpr Board::RadioInstance RADIO = Board::Radios[0];
+static constexpr Board::GpsInstance GPS = Board::Gpses[0];
+
+static_assert(RADIO.model == Board::RadioModel::SX1276,
+              "lora915_rx_test requires Board::Radios[0] to be an SX1276");
+static_assert(RADIO.bus == Board::Bus::SPI0,
+              "lora915_rx_test currently supports the SX1276 on SPI0 only");
+static_assert(GPS.bus == Board::Bus::UART0,
+              "lora915_rx_test currently supports GPS on UART0 only");
+static_assert(GPS.nav_hz > 0, "GPS nav_hz must be non-zero");
+static_assert(GPS.nav_hz <= Board::spec_of(GPS.model).max_nav_hz,
+              "GPS nav_hz exceeds the selected receiver's device spec");
+static_assert(RADIO.freq_mhz >= Board::spec_of(RADIO.model).freq_min_mhz &&
+              RADIO.freq_mhz <= Board::spec_of(RADIO.model).freq_max_mhz,
+              "LoRa operating frequency outside the device's supported band");
+
+// -- LoRa0 / 915 MHz radio wiring (SPI0) — from the active board profile --------
 static constexpr uint PIN_EN   = Pins::LORA0_EN;    // power enable (active high)
 static constexpr uint PIN_DIO0 = Pins::LORA0_DIO0;  // G0 / IRQ (RxDone)
 static constexpr uint PIN_SCK  = Pins::LORA0_SCK;
 static constexpr uint PIN_MOSI = Pins::LORA0_MOSI;
 static constexpr uint PIN_MISO = Pins::LORA0_MISO;
-static constexpr uint PIN_NSS  = Pins::LORA0_NSS;   // CS
+static constexpr uint PIN_NSS  = RADIO.cs_pin;      // CS
 static constexpr uint PIN_RST  = Pins::LORA0_RST;   // reset
 
-// -- LoRa0 air config — from LoRa0Cfg in shared.hpp ----------------------------
-static constexpr float   FREQ_MHZ  = 915.0f;
-static constexpr float   BW_KHZ    = 125.0f;
-static constexpr uint8_t SF        = 7;
-static constexpr uint8_t CR        = 5;
-static constexpr uint8_t SYNC_WORD = 0x12;
-static constexpr int8_t  TX_DBM    = 20;   // unused in RX, kept for config parity
-static constexpr uint16_t PREAMBLE = 8;
+// -- LoRa0 air config from this target's board_profile.hpp ---------------------
+static constexpr float   FREQ_MHZ  = RADIO.freq_mhz;
+static constexpr float   BW_KHZ    = Board::Lora915::BW_KHZ;
+static constexpr uint8_t SF        = Board::Lora915::SF;
+static constexpr uint8_t CR        = Board::Lora915::CR;
+static constexpr uint8_t SYNC_WORD = Board::Lora915::SYNC_WORD;
+static constexpr int8_t  TX_DBM    = Board::Lora915::TX_DBM;   // unused in RX, kept for config parity
+static constexpr uint16_t PREAMBLE = Board::Lora915::PREAMBLE;
 
 // CSV identity for this tool.
 static constexpr const char* ROLE = "rx";
 static constexpr const char* MOD  = "lora";
 
-// GPS wiring — from gs_pcb_v1 board pin map (UART0 TX=12, RX=13).
+// GPS wiring comes from the active board pin map; baud comes from profile.
 static constexpr uint8_t  RADIO_GPS_TX_PIN = Pins::GPS_TX;
 static constexpr uint8_t  RADIO_GPS_RX_PIN = Pins::GPS_RX;
-static constexpr uint32_t RADIO_GPS_BAUD   = 230400;  // u-center2 verified data rate
+static constexpr uint32_t RADIO_GPS_BAUD   = GPS.baud;  // preferred listen-only baud
 
 // Temporary u-center bridge mode. This bypasses the radio test, does not send
 // any GPS configuration commands, and just relays USB CDC <-> GPS UART0.

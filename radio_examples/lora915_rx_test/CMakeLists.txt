@@ -74,7 +74,8 @@ add_executable(lora915_rx_test main.cpp ${RADIO_COMMON_SOURCES})
 # PicoHal.h (Pico SDK implementation of RadioLibHal) lives in lora/hal/.
 # rf_csv.h (shared CSV output schema) lives in ../common/.
 target_include_directories(lora915_rx_test PRIVATE
-    ${AVIONICS_ROOT}            # boards/gs_pcb_v1_pins.hpp
+    ${AVIONICS_ROOT}            # boards/board.hpp + boards/<board>_pins.hpp
+    ${CMAKE_CURRENT_LIST_DIR}   # this project's board_profile.hpp (APP_HAS_* + Board::)
     ${LORA_ROOT}/hal
     ${RADIO_COMMON_INCLUDE}
 )

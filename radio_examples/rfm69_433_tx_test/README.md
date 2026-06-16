@@ -10,12 +10,11 @@ end-to-end.
 
 ## Config (matches ground-station LoRa1 / RF69)
 
-- 433.0 MHz, GFSK (Gaussian shaping BT=0.5), 4.8 kbps, 5 kHz deviation,
+- 424.500 MHz, GFSK (Gaussian shaping BT=0.5), 4.8 kbps, 5 kHz deviation,
   125 kHz RX bandwidth, 16-bit preamble, **+20 dBm** (HCW PA boost)
 - SPI1: SCK=10, MOSI=11, MISO=8, NSS=9; DIO0=27, RST=26, power-enable=28
 
-Pins and air config are copied from
-`projects/ground_station/pico/src/shared.hpp` and `lora1_task.cpp`.
+Pins, devices, and air config come from this target's `board_profile.hpp`.
 
 ## Build
 

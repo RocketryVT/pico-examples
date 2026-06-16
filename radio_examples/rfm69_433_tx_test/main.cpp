@@ -25,38 +25,60 @@
 #include "FreeRTOS.h"
 #include "task.h"
 
-#include "boards/board_pins.hpp"   // Pins:: for the active PICO_BOARD (board-neutral)
+#include "boards/board.hpp"   // HAS_* flags + Pins:: + Board:: device profile
 
 #include <cstdio>
 #include <cstring>
 #include <cmath>
 
-// -- LoRa1 / 433 MHz RFM69HCW wiring (SPI1) — from gs_pcb_v1 board pin map ------
+static_assert(HAS_RADIO, "rfm69_433_tx_test requires a radio (set APP_HAS_RADIO in board_profile.hpp)");
+static_assert(HAS_GPS,   "rfm69_433_tx_test requires a GPS (set APP_HAS_GPS in board_profile.hpp)");
+static_assert(Board::RadioCount > 0, "rfm69_433_tx_test requires at least one Board::Radios entry");
+static_assert(Board::GpsCount > 0, "rfm69_433_tx_test requires at least one Board::Gpses entry");
+
+static constexpr Board::RadioInstance RADIO = Board::Radios[0];
+static constexpr Board::GpsInstance GPS = Board::Gpses[0];
+
+static_assert(RADIO.model == Board::RadioModel::RFM69HCW,
+              "rfm69_433_tx_test requires Board::Radios[0] to be an RFM69HCW");
+static_assert(RADIO.bus == Board::Bus::SPI1,
+              "rfm69_433_tx_test currently supports the RFM69 on SPI1 only");
+static_assert(GPS.bus == Board::Bus::UART0,
+              "rfm69_433_tx_test currently supports GPS on UART0 only");
+static_assert(GPS.nav_hz > 0, "GPS nav_hz must be non-zero");
+static_assert(GPS.nav_hz <= Board::spec_of(GPS.model).max_nav_hz,
+              "GPS nav_hz exceeds the selected receiver's device spec");
+static_assert(RADIO.freq_mhz >= Board::spec_of(RADIO.model).freq_min_mhz &&
+              RADIO.freq_mhz <= Board::spec_of(RADIO.model).freq_max_mhz,
+              "RFM69 operating frequency outside the device's supported band");
+
+// -- LoRa1 / 433 MHz RFM69HCW wiring (SPI1) — from the active board profile ----
 static constexpr uint PIN_MISO = Pins::LORA1_MISO;
-static constexpr uint PIN_NSS  = Pins::LORA1_NSS;   // CS
+static constexpr uint PIN_NSS  = RADIO.cs_pin;      // CS
 static constexpr uint PIN_SCK  = Pins::LORA1_SCK;
 static constexpr uint PIN_MOSI = Pins::LORA1_MOSI;
 static constexpr uint PIN_RST  = Pins::LORA1_RST;   // reset
 static constexpr uint PIN_DIO0 = Pins::LORA1_DIO0;  // G0 / IRQ (TxDone)
 static constexpr uint PIN_EN   = Pins::LORA1_EN;    // power enable (active high)
 
-// -- LoRa1 / RF69 air config — from LoRa1Cfg in shared.hpp ----------------------
-static constexpr float    FREQ_MHZ  = 433.0f;
-static constexpr float    BR_KBPS   = 4.8f;    // bit rate
-static constexpr float    FDEV_KHZ  = 5.0f;    // frequency deviation
-static constexpr float    RXBW_KHZ  = 125.0f;  // RX channel filter bandwidth
-static constexpr int8_t   TX_DBM    = 20;      // +20 dBm with PA boost (HCW)
-static constexpr uint16_t PREAMBLE  = 16;      // preamble length in bits
-static constexpr bool     HIGH_POWER = true;   // RFM69HCW PA-boost variant
+// -- RF69 air config from this target's board_profile.hpp ----------------------
+static constexpr float    FREQ_MHZ   = RADIO.freq_mhz;
+static constexpr float    BR_KBPS    = Board::Rfm433::BR_KBPS;
+static constexpr float    FDEV_KHZ   = Board::Rfm433::FDEV_KHZ;
+static constexpr float    RXBW_KHZ   = Board::Rfm433::RXBW_KHZ;
+static constexpr int8_t   TX_DBM     = Board::Rfm433::TX_DBM;
+static constexpr uint16_t PREAMBLE   = Board::Rfm433::PREAMBLE;
+static constexpr bool     HIGH_POWER = Board::Rfm433::HIGH_POWER;
+static constexpr uint8_t  PACKET_LEN = 32;
 
 // CSV identity for this tool.
 static constexpr const char* ROLE = "tx";
 static constexpr const char* MOD  = "gfsk";
 
-// GPS wiring — from gs_pcb_v1 board pin map (UART0 TX=12, RX=13).
+// GPS wiring comes from the active board pin map; baud/rate come from profile.
 static constexpr uint8_t  GPS_TX_PIN = Pins::GPS_TX;
 static constexpr uint8_t  GPS_RX_PIN = Pins::GPS_RX;
-static constexpr uint32_t GPS_BAUD   = 115200;  // Flywoo GM10 Nano V3.1 default
+static constexpr uint32_t GPS_BAUD   = GPS.baud;
 
 // HAL + radio. Declared static/global because RadioLib keeps internal pointers
 // into the HAL and Module objects.
@@ -73,9 +95,15 @@ static constexpr UBaseType_t RADIO_TASK_PRIORITY = 2;
 static StaticTask_t s_radio_tcb;
 static StackType_t  s_radio_stack[4096];
 
-// RF69 GFSK + HCW high-power init. Mirrors the ground-station RF69 wrapper:
-// begin() can't set >13 dBm with the PA-boost flag, so cap power at 13 for
-// begin() then re-apply the real power with high_power=true.
+static int log_init_step( const char* label, int state )
+{
+    log_print( "# [tx] %s = %d\n", label, state );
+    return state;
+}
+
+// RF69 GFSK + HCW high-power init. begin() can't set >13 dBm with the PA-boost
+// flag, so cap power at 13 for begin() then re-apply the real power with
+// high_power=true.
 static int radio_init()
 {
     const int8_t init_power = ( HIGH_POWER && TX_DBM > 13 ) ? 13 : TX_DBM;
@@ -88,19 +116,48 @@ static int radio_init()
     cfg.power              = init_power;
     cfg.preambleLength     = PREAMBLE;
 
-    int err = radio.begin( cfg );
+    int err = log_init_step( "begin", radio.begin( cfg ) );
+    if ( err != RADIOLIB_ERR_NONE ) return err;
+
+    // Use fixed-length packet mode for this sanity test. It avoids depending on
+    // the RF69 variable-length FIFO byte, which is what we are trying to prove.
+    err = log_init_step( "fixedPacketLengthMode", radio.fixedPacketLengthMode( PACKET_LEN ) );
     if ( err != RADIOLIB_ERR_NONE ) return err;
 
     // GFSK: Gaussian shaping, BT = 0.5. Must match the receiver.
-    err = radio.setDataShaping( RADIOLIB_SHAPING_0_5 );
+    err = log_init_step( "setDataShaping", radio.setDataShaping( RADIOLIB_SHAPING_0_5 ) );
     if ( err != RADIOLIB_ERR_NONE ) return err;
 
     // Re-apply output power with the PA-boost flag for the HCW variant.
     if ( HIGH_POWER ) {
-        err = radio.setOutputPower( TX_DBM, true );
+        err = log_init_step( "setOutputPowerHigh", radio.setOutputPower( TX_DBM, true ) );
         if ( err != RADIOLIB_ERR_NONE ) return err;
     }
     return RADIOLIB_ERR_NONE;
+}
+
+static int transmit_packet( const uint8_t* data, size_t len )
+{
+    int state = radio.startTransmit( data, len );
+    if ( state != RADIOLIB_ERR_NONE ) return state;
+
+    const uint32_t timeout_ms =
+        10u + static_cast<uint32_t>( ( static_cast<float>( len * 8u ) / BR_KBPS ) * 5.0f );
+    const uint32_t start_ms = to_ms_since_boot( get_absolute_time() );
+
+    for ( ;; ) {
+        const uint8_t irq2 = module_.SPIreadRegister( RADIOLIB_RF69_REG_IRQ_FLAGS_2 );
+        if ( gpio_get( PIN_DIO0 ) || ( irq2 & RADIOLIB_RF69_IRQ_PACKET_SENT ) ) {
+            return radio.finishTransmit();
+        }
+
+        if ( to_ms_since_boot( get_absolute_time() ) - start_ms > timeout_ms ) {
+            radio.finishTransmit();
+            return RADIOLIB_ERR_TX_TIMEOUT;
+        }
+
+        vTaskDelay( pdMS_TO_TICKS( 1 ) );
+    }
 }
 
 // -- Radio task: RFM69 init + 1 Hz beacon loop (core 1) -----------------------
@@ -127,16 +184,16 @@ static void radio_task( void* )
     log_print( "# [tx] RFM69HCW ready. Transmitting...\n" );
     rf_csv_header();
 
-    char     msg[64];
+    uint8_t  msg[PACKET_LEN];
     uint32_t count = 0;
 
     for ( ;; ) {
-        snprintf( msg, sizeof(msg), "rfm69_433_tx_test #%lu", (unsigned long)count );
-        const size_t len = strlen( msg );
+        memset( msg, 0, sizeof(msg) );
+        snprintf( reinterpret_cast<char*>( msg ), sizeof(msg),
+                  "rfm69_433_tx_test #%08lu", (unsigned long)count );
 
         const uint32_t t0  = to_ms_since_boot( get_absolute_time() );
-        state = radio.transmit( reinterpret_cast<uint8_t*>( msg ),
-                                static_cast<size_t>( len ) );
+        state = transmit_packet( msg, PACKET_LEN );
         const uint32_t t1  = to_ms_since_boot( get_absolute_time() );
         const uint32_t air = t1 - t0;
 
@@ -145,7 +202,7 @@ static void radio_task( void* )
 
         rf_csv_row( t1, ROLE, FREQ_MHZ, MOD,
                     ( state == RADIOLIB_ERR_NONE ) ? "tx_ok" : "tx_fail",
-                    (long)count, (long)len,
+                    (long)count, (long)PACKET_LEN,
                     NAN, NAN, NAN, -1, -1, -1, NAN, (long)air );
 
         rf_log_sync();   // flush this row to flash before the next beacon.
@@ -171,8 +228,8 @@ int main()
         rf_csv_set_sink( rf_log_write );
     }
 
-    // Bring up the UART0 GPS and auto-configure UBX NAV-PVT (stamps utc/gps_*).
-    gps_task_init( GPS_TX_PIN, GPS_RX_PIN, GPS_BAUD );
+    // Bring up the profile GPS and auto-configure UBX NAV-PVT (stamps utc/gps_*).
+    gps_task_init_nav_hz( GPS_TX_PIN, GPS_RX_PIN, GPS_BAUD, GPS.nav_hz );
 
     rf_csv_set_stdout_enabled( false );
     log_print( "# console: 'list' / 'export <n>' / 'live on' (or 'help') over USB\n" );
