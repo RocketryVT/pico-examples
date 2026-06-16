@@ -297,9 +297,12 @@ int main()
         const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
         if (now_ms - last_fix_print_ms >= 1000u) {
             const gps::Coordinate& c = gps_driver->coordinate();
-            printf("[fix] valid=%d lat=%.7f lon=%.7f alt=%.1f sats=%d speed=%.2f course=%.1f "
-                   "vel_ned=(%ld,%ld,%ld) source=%s\n",
+            const bool stale = gps_driver->is_stale();
+            printf("[fix] valid=%d stale=%d age_ms=%lu lat=%.7f lon=%.7f alt=%.1f sats=%d "
+                   "speed=%.2f course=%.1f vel_ned=(%ld,%ld,%ld) source=%s\n",
                    c.valid ? 1 : 0,
+                   stale ? 1 : 0,
+                   static_cast<unsigned long>(gps_driver->fix_age_ms()),
                    c.latitude,
                    c.longitude,
                    static_cast<double>(c.altitude),
